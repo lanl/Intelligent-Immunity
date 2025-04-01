@@ -1,0 +1,3320 @@
+---
+title: "transcripts-LPS-code"
+author: "K. Martinez, K. Wilding"
+date: "2025-01-13"
+output: 
+  html_document: 
+    fig_height: 10
+    code_folding: show
+    fig_width: 15
+    toc: yes
+    toc_float:
+      collapsed: no
+      smooth_scroll: no
+    toc_depth: 6
+    highlight: default
+editor_options: 
+  chunk_output_type: console
+---
+
+# Copyright
+© 2025. Triad National Security, LLC. All rights reserved.
+
+This program was produced under U.S. Government contract 89233218CNA000001 for Los Alamos National Laboratory (LANL), which is operated by Triad National Security, LLC for the U.S. Department of Energy/National Nuclear Security Administration. All rights in the program are reserved by Triad National Security, LLC, and the U.S. Department of Energy/National Nuclear Security Administration. The Government is granted for itself and others acting on its behalf a nonexclusive, paid-up, irrevocable worldwide license in this material to reproduce, prepare. derivative works, distribute copies to the public, perform publicly and display publicly, and to permit others to do so.
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set up
+
+
+## Environment Set Up
+
+```{r Libraries and Directories, echo=TRUE, message=FALSE, warning=FALSE}
+rm(list=ls())
+working.dr <- "PATH"
+setwd(working.dr)
+# Model Libraries
+library(randomForest)
+library(glmnet)
+library(naivebayes)
+library(neuralnet)
+library(nnet)
+library(e1071)
+library(klaR)
+library(kernlab)
+library(RSNNS)
+## Basic Libraries
+library(plyr)
+library(tidyverse)
+library(xtable)
+library(readxl)
+library(ggthemes)
+library(hrbrthemes)
+library(viridis)
+library(colorspace)
+library(caret)
+library(ggpubr)
+library(pROC)
+
+
+```
+
+```{r Function Definitions}
+multiplesheets <- function(fname,sheet_nums) {
+  # getting info about all excel sheets
+  sheets <- readxl::excel_sheets(fpath)[sheet_nums]
+  ## make list from sheets determined by sheet_nums. Skip 2 rows, and repair names
+  tibble <- lapply(sheets, function(x) readxl::read_excel(fpath, sheet = x, skip=2,.name_repair = make.names))
+  data_frame <- lapply(tibble, as.data.frame)
+  # assigning names to data frames
+  names(data_frame) <- make.names(sheets)
+  # print data frame
+  return(data_frame)
+}
+```
+
+# Data Import, Clean, Normalization
+
+The primary structure of this code and background on the data comes from LPS_qPCR_Analysis_ModelBuild.Rmd. Refer to that file for more details. This is just getting all the data into a tidy format and then
+
+### Raw Data Sets
+
+#### Primary LPS Data
+
+```{r Import Data, message=FALSE, warning=FALSE}
+# specifying the path name
+fpath <- "data/Int_Imm_Sample_Spreadsheet_current.xlsx"
+LPS.meta.data <- read_excel(fpath,sheet=excel_sheets(fpath)[1],.name_repair = make.names)
+LPS.qPCR.list.plates <- multiplesheets(fpath,2:length(excel_sheets(fpath)))
+```
+
+```{r Clean and Organize Data, message=FALSE, warning=FALSE}
+LPS.qPCR.tidy <-  LPS.qPCR.list.plates %>% 
+  ## map() allows us to apply these dplyr fxns across all dfs in the list
+  map(~.x %>% 
+        mutate(across(starts_with("X"), ~ as.numeric(replace(.x,.x=="Undetermined",41)))) %>% 
+        pivot_longer(starts_with("X"),names_to="SampleIndex",values_to="CT_value")
+  ) %>% 
+  bind_rows() %>% 
+  filter(!is.na(CT_value)) %>% ## filter out experiments not run yet
+  mutate(SampleIndex=gsub("X","",SampleIndex)) %>% 
+  left_join(LPS.meta.data, 
+            by=c("SampleIndex"="X3.Letter.Code"))
+
+# LPS.qPCR.wide <-  bind_rows(LPS.qPCR.list.tidy) %>% pivot_wider(names_from = SampleIndex,values_from=CT_value)
+```
+
+#### Delayed/New Tech LPS Exp
+
+```{r MJ LPS Data, message=FALSE, warning=FALSE}
+fpath <- "data/09012022_ctvalues_noLPSvsLPS_bothexperiments.xlsx"
+MJ.LPS.qPCR.raw <- read_excel(fpath)[-1,-1] 
+MJ.LPS.qPCR.tidy <- MJ.LPS.qPCR.raw %>% 
+  pivot_longer(!Symbol,names_to="SampleIndex",values_to="CT_value") %>% 
+  mutate(LPS.Added=ifelse(grepl("no",SampleIndex),0,1)) %>% 
+  mutate(CT_value=as.numeric(ifelse(CT_value=="Undetermined","41",CT_value))) %>% 
+  rename(Gene.Symbol=Symbol)
+```
+
+#### LPS Smaller Panel
+
+## Normalization to HK: B2M
+
+This is the normalization to only B2M
+
+```{r Normalization 1, message=FALSE, warning=FALSE}
+LPS.qPCR.norm1.tidy <- full_join(LPS.qPCR.tidy %>%
+                                   filter(Gene.Symbol%in%c("B2M")) %>%  
+                                   group_by(SampleIndex) %>% 
+                                   summarise(HK_mean=mean(CT_value,na.rm = T)),
+                                 LPS.qPCR.tidy %>% 
+                                   mutate(CT_value=ifelse(CT_value==41,NA,CT_value))) %>% 
+  mutate(CT_value_norm1=CT_value-HK_mean) %>% 
+  mutate(CT_value_norm1=ifelse(is.na(CT_value_norm1),max(CT_value_norm1,na.rm = T)+1,CT_value_norm1))
+#MJ LPS
+MJ.LPS.qPCR.norm1.tidy <- full_join(MJ.LPS.qPCR.tidy %>%
+                                     filter(Gene.Symbol%in%c("B2M")) %>%  
+                                     group_by(SampleIndex) %>% 
+                                     summarise(HK_mean=mean(CT_value,na.rm = T)),
+                                    MJ.LPS.qPCR.tidy %>% 
+                                     mutate(CT_value=ifelse(CT_value==41,NA,CT_value))) %>% 
+  mutate(CT_value_norm1=CT_value-HK_mean) %>% 
+  mutate(CT_value_norm1=ifelse(is.na(CT_value_norm1),max(CT_value_norm1,na.rm = T)+1,CT_value_norm1)) 
+```
+
+## Model Data Format
+
+```{r All Model Data, message=FALSE, warning=FALSE}
+# Primary LPS
+LPS.model.data <- LPS.qPCR.norm1.tidy %>% 
+  filter(!(Gene.Symbol%in%c("ACTB","B2M","GAPDH","HPRT1","RPLP0","HGDC","RTC","PPC"))) %>%  ## Filter out Controls
+  select(LPS.Added,CT_value_norm1,Gene.Symbol,SampleIndex) %>%
+  group_by(SampleIndex) %>% 
+  ungroup() %>% 
+  pivot_wider(names_from=Gene.Symbol,values_from=CT_value_norm1) %>% 
+  select(-SampleIndex) %>%
+  mutate(LPS.Added=ifelse(LPS.Added=="Y",1,0)) %>% 
+  rename(IL13="1L13") ## I think this is supposed to be IL13 not 1L13
+#MJ LPS 
+MJ.LPS.model.data <- MJ.LPS.qPCR.norm1.tidy %>% 
+  filter(!(Gene.Symbol%in%c("ACTB","B2M","GAPDH","HPRT1","RPLP0","HGDC","RTC","PPC"))) %>%  ## Filter out Controls
+  select(LPS.Added,CT_value_norm1,Gene.Symbol,SampleIndex) %>%
+  group_by(SampleIndex) %>% 
+  ungroup() %>% 
+  pivot_wider(names_from=Gene.Symbol,values_from=CT_value_norm1) %>% 
+  # select(-Proto_SampleIndex) %>%
+  mutate(LPS.Added=ifelse(LPS.Added==1,1,0)) #%>% 
+  # rename(IL13="1L13")
+
+```
+
+# Train/Test Split Stability
+
+This will run a train/test split stability analysis for all the considered models at the same time. The models used will use the default hyper-parameters where possible to minimize structural differences among trained models.
+
+-   Random Forest: mtry - sqrt(84)=9.1615, ntree=500
+
+-   Logistic Regression: lambda =  .01 (based on a cv.glmnet)
+
+-   SVM: kernel=linear, Cost = 1
+
+-   Naive Bayes: usekernel=TRUE (non-parametric kernel density - no normal assumption)
+
+-   Single Layer Neural Net: size =??? , decay = 0, maxit=100 size determined by preliminary tuning(see directly below)
+
+-  Do not need this anymore, as RFE only supports single layer nnet* 2 hidden layer NN: size 42, 21, error function= "ce", linear output = FALSE* 
+
+Clearly there are many more options for the hyper parameters, but as this is a test to see what a good train/test split is for limited data, simple hyper parameter tunning will have to come next. \## Functions For Train/Test Split
+
+```{r NN basic tune size}
+# trainctrl <- trainControl(method="repeatedcv", number=10, repeats=5)
+# nnetGrid <-  expand.grid(size = seq(from = 1, to = 11, by = 1),
+#                         decay = c(0,.5,.1,.05,.01,.001,.0001))
+# nn.pre.mod <- train(x=LPS.model.data[,-1],as.factor(LPS.model.data$LPS.Added),
+#                     method="nnet",tuneGrid = nnetGrid,trace=FALSE,linout=FALSE,trControl = trainctrl)
+```
+
+```{r RF basic tune size}
+# trainctrl <- trainControl(method="repeatedcv", number=10, repeats=2)
+# rfGrid <-  expand.grid(mtry = seq(from = 1, to = 10, by = 1))
+# rf.pre.mod <- train(x=LPS.model.data[,-1],as.factor(LPS.model.data$LPS.Added),
+#                     method="rf",tuneGrid = rfGrid,trControl = trainctrl)
+# any value between 2 and 39 is justifiable. So using default sqrt(84) makes sense.
+```
+
+```{r GLM basic tune}
+# glm.pre.mod <- cv.glmnet(x=as.matrix(LPS.model.data[,
+#                                           -which(colnames(LPS.model.data) ==
+#                                                      "LPS.Added")]),
+#                    y = as.vector(LPS.model.data$LPS.Added),family = "binomial",type.measure = "class",
+#                    lambda=c(5e-1,1e-1,5e-2,1e-2,5e-3,1e-3,5e-4,1e-4,5e-5,1e-5))
+# glm_grid=expand.grid(lambda=c(1e-1,1e-2,1e-3,1e-4,1e-5),
+#                      alpha=1)
+# glm.pre.mod <- train(x=LPS.model.data[,-c(1)],y=as.factor(LPS.model.data$LPS.Added),
+#                    method="glmnet",family="binomial",tuneGrid=glm_grid)
+
+
+### Everytime this is run you get WILDLY different answers. ranging from .01-.1 picking one that makes sense.
+```
+
+```{r SVM basic tune}
+# svm.pre.mod <- tune(svm,as.factor(LPS.Added)~.,data=LPS.model.data,kernel='linear',ranges=list(cost = c(1,1e-1,1e-2,1e-3,1e-4,1e-5)))
+# svm.pre.mod$best.parameters
+### Everytime this is run you get WILDLY different answers. ranging from .005-5 picking one that makes sense.
+
+```
+
+```{r General Error Function, message=FALSE, warning=FALSE}
+generate.errors.ML <- function(model.string,model.obj,predictors){
+  y <- predictors$LPS.Added
+  if(model.string %in% c("RF","SVM")){
+    observed <- as.factor(y)
+    CM <- caret::confusionMatrix(predict(model.obj, predictors),observed)
+  } else if(model.string=="NB"){
+    observed <- as.factor(as.logical(y))  
+    CM <- caret::confusionMatrix(predict(model.obj, predictors),observed)
+    } else if(grepl("NN3",model.string)){
+      observed <- as.factor(y)
+      predictorsnn3 <- predictors[,-1]
+      CM <- caret::confusionMatrix(factor(round(predict(model.obj,predictorsnn3)[,1]),levels=c(0,1)),observed)
+    } else if(grepl("NN",model.string)){
+      observed <- as.factor(y)
+      CM <- caret::confusionMatrix(factor(predict(model.obj,newdata=predictors,type="class"),levels=c(0,1)),observed)
+    } else if(model.string=="GLM"){
+      # observed <- as.vector(y)
+      # CM <- caret::confusionMatrix(
+      #   as.factor(predict(model.obj,
+      #                     as.matrix(predictors[, -which(colnames(predictors) ==
+      #                                                     "LPS.Added")]),type="class",s='lambda.min')),
+      #   as.factor(observed))
+      observed <- as.factor(y)
+      CM <- caret::confusionMatrix(as.factor(predict(model.obj,newx = as.matrix(predictors[,-1]),type="class")),
+                            observed)
+    } 
+  error.vec <- c(CM$overall,CM$byClass)
+  return(error.vec)
+}
+
+## Model Errors
+    error_tab <- function(model.string,model.obj,train_data,test_data){
+      error_train <- generate.errors.ML(model.string,model.obj,predictors=train_data) %>% 
+        data.frame(error_val=.) %>% 
+        rownames_to_column(var="error_type") %>% 
+        mutate(split_data="train")
+      error_test <- generate.errors.ML(model.string,model.obj,predictors=test_data)%>% 
+        data.frame(error_val=.) %>% rownames_to_column(var="error_type") %>% 
+        mutate(split_data="test")
+      error_mat <- bind_rows(error_train,error_test) %>% mutate(model_type=model.string)
+      return(error_mat)
+    }
+
+```
+
+```{r Train/Test Split Robustness Function}
+# # For Testing
+# model.data <- LPS.model.data
+# nrep <- 2
+
+train_test_stability <- function(nrep=5,model.data){
+  split.vec <- seq(0,1,by=.02)
+  split.vec <- split.vec[-c(1:5,(length(split.vec)-4):length(split.vec))]
+  # split.vec <- split.vec[c(1,5,10,15)]
+all.models <- vector("list",length(split.vec))
+names(all.models) <- split.vec
+for(i in 1:length(split.vec)){
+  prop=split.vec[i]
+  model.group <- vector("list", nrep)
+  names(model.group) <- 1:nrep
+  message(paste("Starting",split.vec[i]))
+  for(k in 1:nrep){
+    model.obj <- vector("list",4)
+    names(model.obj) <- c("split.index",
+                          "train.scale",
+                          "models",
+                          "errors") 
+    # Train Test Split
+    train_index <- createDataPartition(model.data$LPS.Added,p=prop,list=F)
+    model.obj[["split.index"]] <- train_index
+    # train_data <- model.data[train_index,]
+    # test_data <- model.data[-train_index,]
+    
+    # Scale Data to training data
+    train.min.max <- model.data[train_index,] %>%
+      pivot_longer(!LPS.Added,names_to = "Gene",values_to = "CT_norm1") %>%
+      group_by(Gene) %>%
+      summarise(CTmin=min(CT_norm1),
+                CTmax=max(CT_norm1)) %>%
+      ungroup()
+    model.obj[["train.scale"]] <- train.min.max
+    
+    train_data <- model.data[train_index,] %>%
+      pivot_longer(!LPS.Added,names_to = "Gene",values_to = "CT_norm1") %>%
+      full_join(train.min.max,by="Gene") %>%
+      mutate(CT_scaled=(CT_norm1-CTmin)/(CTmax-CTmin)) %>%
+      mutate(CT_scaled=ifelse(is.finite(CT_scaled),CT_scaled,1)) %>% 
+      select(LPS.Added,Gene,CT_scaled) %>%
+      group_by(Gene) %>%
+      mutate(row_num=row_number()) %>%
+      pivot_wider(names_from="Gene",values_from="CT_scaled") %>%
+      select(-row_num)
+    
+    test_data <- model.data[-train_index,] %>%
+      pivot_longer(!LPS.Added,names_to = "Gene",values_to = "CT_norm1") %>%
+      full_join(train.min.max,by="Gene") %>%
+      mutate(CT_scaled=(CT_norm1-CTmin)/(CTmax-CTmin)) %>%
+      mutate(CT_scaled=ifelse(is.finite(CT_scaled),CT_scaled,1))%>%
+      select(LPS.Added,Gene,CT_scaled) %>%
+      group_by(Gene) %>%
+      mutate(row_num=row_number()) %>%
+      pivot_wider(names_from="Gene",values_from="CT_scaled") %>%
+      select(-row_num)
+    # Train Models 
+    # function(model.string,model.obj,predictors)
+    mods.list <- vector("list", 6)
+    names(mods.list) <- c("rf","nb","svm","glm","nn","nn3")
+    
+    mod.rf <- randomForest(as.factor(LPS.Added)~., data=train_data,
+                           proximity=TRUE,importance=TRUE,ntree=500,keep.forest=TRUE)
+    mods.list[["rf"]] <- mod.rf
+    
+    mod.nb <- naive_bayes(as.logical(LPS.Added) ~ ., data = train_data, usekernel = T, type="raw")
+    mods.list[["nb"]] <- mod.nb
+    
+    mod.svm <- svm(as.factor(LPS.Added)~.,data=train_data,cost=.1, kernel='linear')
+    mods.list[["svm"]] <- mod.svm
+    
+    # mod.glm <- cv.glmnet(x = as.matrix(train_data[, 
+    #                                               -which(colnames(train_data) == 
+    #                                                        "LPS.Added")]), 
+    #                      y = as.vector(train_data$LPS.Added), 
+    #                      type.measure = "class", 
+    #                      family = "binomial")
+    mod.glm <- glmnet(x=train_data[,-1],
+                   y=as.factor(train_data$LPS.Added),
+                   family = "binomial",lambda = .01)
+    mods.list[["glm"]] <- mod.glm
+
+    mod.nn <- nnet(as.factor(LPS.Added) ~ ., data = train_data ,size=8,linout = FALSE,trace=F,decay=.1)
+    mods.list[["nn"]] <- mod.nn
+    
+    # library(RSNNS)
+    mod.nn3 <- mlp(x=train_data[,-1],
+                   y=train_data$LPS.Added , size = c(80,20,29))
+    mods.list[["nn3"]] <- mod.nn3
+
+    
+    model.obj[["models"]] <- mods.list
+    
+    ## Model Errors
+    error_tab <- function(model.string,model.obj,train_data,test_data){
+      error_train <- generate.errors.ML(model.string,model.obj,predictors=train_data) %>% 
+        data.frame(error_val=.) %>% 
+        rownames_to_column(var="error_type") %>% 
+        mutate(split_data="train")
+      error_test <- generate.errors.ML(model.string,model.obj,predictors=test_data)%>% 
+        data.frame(error_val=.) %>% rownames_to_column(var="error_type") %>% 
+        mutate(split_data="test")
+      error_mat <- bind_rows(error_train,error_test) %>% mutate(model_type=model.string)
+      return(error_mat)
+    }
+    errors <- bind_rows(error_tab(model.string="RF",model.obj=mod.rf,train_data,test_data),
+                        error_tab(model.string="GLM",model.obj=mod.glm,train_data,test_data),
+                        error_tab(model.string="SVM",model.obj=mod.svm,train_data,test_data),
+                        error_tab(model.string="NN",model.obj=mod.nn,train_data,test_data),
+                        error_tab(model.string="NN3",model.obj=mod.nn3,train_data,test_data),
+                        error_tab(model.string="NB",model.obj=mod.nb,train_data,test_data)) %>% 
+      filter(error_type%in%c("Accuracy","Sensitivity","Specificity","Precision"))
+    model.obj[["errors"]] <- errors
+    # auc <- bind_rows(error_tab(model.string="RF",model.obj=mod.rf,train_data,test_data),
+    #                     error_tab(model.string="GLM",model.obj=mod.glm,train_data,test_data),
+    #                     error_tab(model.string="SVM",model.obj=mod.svm,train_data,test_data),
+    #                     error_tab(model.string="NN",model.obj=mod.nn,train_data,test_data),
+    #                     error_tab(model.string="NN3",model.obj=mod.nn3,train_data,test_data),
+    #                     error_tab(model.string="NB",model.obj=mod.nb,train_data,test_data))
+    # model.obj[["auc"]]
+    # mod.nn
+    # mod.glm
+    # 
+    # Model Errors
+    # model.obj[["model"]] <- mod
+    model.group[[k]] <- model.obj
+    if(k%%100==0){
+      message(paste("Progress",split.vec[i],":",k))
+    }
+  }
+  all.models[[i]] <- model.group
+  # message(paste("Finished",split.vec[i]))
+
+}
+error.data.frame <- data.frame()
+
+for(sp in 1:length(all.models)){
+  error.data.frame <- bind_rows(error.data.frame,bind_rows(purrr::map(all.models[[sp]],~.x[["errors"]] %>%
+                                             mutate(SplitPerc=as.numeric(names(all.models)[sp]))),
+                                .id = "rep"))
+}
+# save(all.models,error.data.frame,model.data,file = paste0("output/traintest_split_stability_",nrep,".RData"))
+return(list(all.models,error.data.frame))
+}
+run_yn=T
+save_yn=T
+if(run_yn==T){
+  system.time({
+  output <- train_test_stability(nrep=200,model.data = LPS.model.data)
+  })
+  error.data.frame <- output[[2]]
+  if(save_yn==T){
+    write.csv(error.data.frame, 
+              paste0(working.dr,"data/traintest_split_stability_errordf.csv"),row.names = FALSE)
+  }
+}
+```
+
+```{r Train/Test Split Analysis}
+
+# load(paste0("output/traintest_split_stability_",nrep,".RData"))
+files <- list.files(working.dr,pattern ="traintest_split",full.names = T)
+files <- files[which(grepl(".csv",files))]
+error.data.frame <- data.frame()
+for(i in files){
+  error.data.frame <- bind_rows(error.data.frame,read.csv(i))
+}
+ggplot(error.data.frame %>% 
+         # filter(error_type=="Accuracy") %>% 
+         filter(split_data=="test") %>% 
+         group_by(SplitPerc,model_type) %>% 
+         mutate(mean_error=mean(error_val,na.rm=T),
+                sd_error=sd(error_val,na.rm=T),
+                mean_sd_top=min(1,mean_error+sd_error),
+                mean_sd_low=mean_error-sd_error) %>% 
+         ungroup() %>% 
+         filter(SplitPerc>=.1&SplitPerc<=.95),
+       # aes(x=SplitPerc,y=1-error_val))+
+       aes(x=SplitPerc,y=error_val))+
+  geom_point(alpha=.01,size=1)+
+  # geom_line(aes(y=1-mean_error),color="forestgreen",size=2)+
+  geom_line(aes(y=mean_error),color="forestgreen",size=1.5)+
+  # geom_line(aes(y=1-mean_sd_top),color="forestgreen",size=1.5,linetype=3,alpha=.9)+
+  # geom_line(aes(y=1-mean_sd_low),color="forestgreen",size=1.5,linetype=3,alpha=.9)+
+  # geom_ribbon(aes(ymax = 1-mean_sd_low, ymin = 1-mean_sd_top),linetype=2, alpha = 0.25)+
+  geom_ribbon(aes(ymin = mean_sd_low, ymax = mean_sd_top),linetype=2, alpha = 0.25)+
+  xlab("Training Data Percetage")+
+  ylab("Testing Error")+
+  facet_grid(error_type~model_type)+
+  theme_clean()+ 
+  scale_x_continuous(breaks = seq(0, 1, by = .2),minor_breaks = seq(0, 1, .1))+
+  theme(text = element_text(size=30),
+        axis.title = element_text(size=20),
+        axis.text = element_text(size=15),
+        panel.grid.major.x = element_line(color = "grey80",linetype = 3),
+        )+
+  # coord_cartesian(ylim=c(0,.5),xlim=c(.1,.9))
+  coord_cartesian(ylim=c(.5,1),xlim=c(.1,.9))
+
+
+ggplot(error.data.frame %>% 
+         filter(error_type=="Accuracy") %>% 
+         filter(split_data=="test") %>% 
+         group_by(SplitPerc,model_type) %>% 
+         mutate(mean_error=mean(error_val,na.rm=T),
+                sd_error=sd(error_val,na.rm=T),
+                mean_sd_top=min(1,mean_error+sd_error),
+                mean_sd_low=mean_error-sd_error) %>% 
+         ungroup() %>% 
+         filter(SplitPerc>=.1&SplitPerc<=.95),
+       # aes(x=SplitPerc,y=1-error_val))+
+       aes(x=SplitPerc))+
+  # geom_point(alpha=.01,size=1)+
+  # geom_line(aes(y=1-mean_error),color="forestgreen",size=2)+
+  geom_line(aes(y=sd_error),color="forestgreen",size=1.5)+
+  # geom_line(aes(y=1-mean_sd_top),color="forestgreen",size=1.5,linetype=3,alpha=.9)+
+  # geom_line(aes(y=1-mean_sd_low),color="forestgreen",size=1.5,linetype=3,alpha=.9)+
+  # geom_ribbon(aes(ymax = 1-mean_sd_low, ymin = 1-mean_sd_top),linetype=2, alpha = 0.25)+
+  # geom_ribbon(aes(ymin = mean_sd_low, ymax = mean_sd_top),linetype=2, alpha = 0.25)+
+  xlab("Training Data Percetage")+
+  ylab("Testing SD")+
+  facet_grid(.~model_type)+
+  theme_clean()+ 
+  scale_x_continuous(breaks = seq(0, 1, by = .2),minor_breaks = seq(0, 1, .1))+
+  theme(text = element_text(size=30),
+        axis.title = element_text(size=20),
+        axis.text = element_text(size=15),
+        panel.grid.major.x = element_line(color = "grey80",linetype = 3),
+        )#+
+  # coord_cartesian(ylim=c(0,.5),xlim=c(.1,.9))
+  # coord_cartesian(ylim=c(.5,1),xlim=c(.1,.9))
+
+error.data.frame %>% 
+  filter(split_data=="test") %>% 
+  filter(error_type=="Accuracy") %>% 
+  group_by(SplitPerc,model_type) %>% 
+  summarise(mean_error=mean(error_val,na.rm=TRUE)) %>% 
+  filter(mean_error==1) %>%
+  arrange(model_type,SplitPerc)
+library(ggokabeito)
+error.data.frame %>% filter(error_type=="Accuracy") %>% 
+  filter(split_data=="test") %>% 
+  group_by(SplitPerc,model_type) %>% 
+  count(error_val) %>% 
+  mutate(Not100Perc=ifelse(error_val<1,TRUE,FALSE)) %>% 
+  group_by(SplitPerc,model_type,Not100Perc,group=Not100Perc) %>% 
+  summarise(total_mods=sum(n)) %>% 
+  mutate(prop=total_mods/300) %>% 
+  filter(!Not100Perc) %>% 
+  ggplot(aes(x=SplitPerc,y=prop,color=model_type))+
+  geom_line(size=2)+facet_wrap(.~Not100Perc)+
+  ylab("Proportion of Models")+
+  theme_clean()+ 
+  scale_x_continuous(breaks = seq(0, 1, by = .2),minor_breaks = seq(0, 1, .1))+
+  theme(text = element_text(size=30),
+        axis.title = element_text(size=20),
+        axis.text = element_text(size=15),
+        panel.grid.major.x = element_line(color = "grey80",linetype = 3),
+        )+
+  scale_color_okabe_ito()
+
+
+test <- error.data.frame %>% filter(error_type=="Accuracy") %>% 
+  filter(split_data=="test") %>% 
+  group_by(SplitPerc,model_type) %>% 
+  count(error_val) %>% 
+  mutate(Not100Perc=ifelse(error_val<1,TRUE,FALSE)) %>% 
+  group_by(SplitPerc,model_type,Not100Perc,group=Not100Perc) %>% 
+  summarise(total_mods=sum(n)) %>% 
+  mutate(prop=total_mods/500) %>% 
+  filter(model_type=="NB") 
+#%>% filter(prop>=.5&!Not100Perc) %>% group_by(model_type) %>% slice_min(SplitPerc)
+#test %>% filter(SplitPerc==.7&!Not100Perc)
+error.data.frame %>% filter(error_type=="Accuracy") %>% 
+  filter(split_data=="test") %>% 
+  group_by(SplitPerc,model_type) %>% 
+  count(error_val) %>% 
+  mutate(Not100Perc=ifelse(error_val<1,TRUE,FALSE)) %>% 
+  group_by(SplitPerc,model_type,Not100Perc,group=Not100Perc) %>% 
+  summarise(total_mods=sum(n)) %>% 
+  mutate(prop=total_mods/500) %>% 
+  filter(SplitPerc==.7) %>% 
+  filter(!Not100Perc)
+
+error.data.frame %>% filter(error_type=="Accuracy") %>% 
+  filter(split_data=="test") %>% 
+  group_by(SplitPerc,model_type) %>% 
+  count(error_val) %>% 
+  mutate(Not100Perc=ifelse(error_val<=.9,TRUE,FALSE)) %>% 
+  group_by(SplitPerc,model_type,Not100Perc,group=Not100Perc) %>% 
+  summarise(total_mods=sum(n)) %>% 
+  mutate(prop=total_mods/500) %>% 
+  filter(SplitPerc==.7) %>% 
+  filter(!Not100Perc)
+
+error.data.frame %>% 
+         filter(error_type=="Accuracy") %>% 
+         filter(split_data=="test") %>% 
+         group_by(SplitPerc,model_type) %>% 
+         mutate(mean_error=mean(error_val,na.rm=T)) %>% 
+         ungroup() %>% 
+         filter(SplitPerc==.7) %>% 
+  select(model_type,mean_error,SplitPerc) %>% 
+  distinct()
+```
+
+```{r Training Data}
+set.seed(1306) # Finalzize seed for this command with a data set. These two lines need to be run back to back for consistent sample. 
+## 4765 RF 1/.95/.833 (on Min/max Gene/Ind scaled)
+## 1885 RF 1/.95/1 (on Min/max Gene/Ind scaled)
+## 1306 RF 1/.95/1 (on Min/max Gene/Ind scaled)
+## 444 RF 1/1/1 
+train_index <- createDataPartition(LPS.model.data$LPS.Added,p=.7,list=F) 
+# Once settled on training set save index and verify that there is no difference between what is generated above and the saved
+train_index_saved <- as.matrix(read.csv("data/II_ML_LPS_train_index.csv"))
+if(length(setdiff(train_index,train_index_saved))==0){
+  train_data <- LPS.model.data[train_index,]
+  test_data <- LPS.model.data[-train_index,]
+  print("Match confirmed. Data Partitioned")
+  
+}else{
+  print("Saved index and generated index DO NOT MATCH. Using saved list.")
+  train_data <- LPS.model.data[train_index_saved,]
+  test_data <- LPS.model.data[-train_index_saved,]
+}
+train.min.max <- train_data %>%
+  pivot_longer(!LPS.Added,names_to = "Gene",values_to = "CT_norm1") %>%
+  group_by(Gene) %>%
+  summarise(CTmin=min(CT_norm1),
+            CTmax=max(CT_norm1)) %>%
+  ungroup()
+
+train_data_scaled <- train_data %>%
+  pivot_longer(!LPS.Added,names_to = "Gene",values_to = "CT_norm1") %>%
+  full_join(train.min.max) %>%
+  mutate(CT_scaled=(CT_norm1-CTmin)/(CTmax-CTmin)) %>%
+  select(LPS.Added,Gene,CT_scaled) %>%
+  group_by(Gene) %>%
+  mutate(row_num=row_number()) %>%
+  pivot_wider(names_from="Gene",values_from="CT_scaled") %>%
+  select(-row_num)
+
+test_data_scaled <- test_data %>%
+  pivot_longer(!LPS.Added,names_to = "Gene",values_to = "CT_norm1") %>%
+  full_join(train.min.max) %>%
+  mutate(CT_scaled=(CT_norm1-CTmin)/(CTmax-CTmin)) %>%
+  select(LPS.Added,Gene,CT_scaled) %>%
+  group_by(Gene) %>%
+  mutate(row_num=row_number()) %>%
+  pivot_wider(names_from="Gene",values_from="CT_scaled") %>%
+  select(-row_num)
+
+MJ.LPS_data_scaled <- MJ.LPS.model.data %>%
+  pivot_longer(!(LPS.Added:SampleIndex),names_to = "Gene",values_to = "CT_norm1") %>%
+  full_join(train.min.max) %>%
+  mutate(CT_scaled=(CT_norm1-CTmin)/(CTmax-CTmin)) %>%
+  select(LPS.Added,Gene,CT_scaled) %>%
+  group_by(Gene) %>%
+  mutate(row_num=row_number()) %>%
+  pivot_wider(names_from="Gene",values_from="CT_scaled") %>%
+  select(-row_num)
+```
+
+```{r TT take 2}
+generate.errors.ML <- function(model.string,model.obj,predictors){
+  y <- predictors$LPS.Added
+  if(model.string %in% c("RF")){
+    observed <- as.factor(y)
+    class_pred <- as.factor(predict(model.obj,predictors,type="response"))
+    prob_pred <- predict(model.obj,predictors,type="prob")[,2]
+    CM <- caret::confusionMatrix(class_pred,observed)
+  } else if(model.string%in%c("SVM")){
+    observed <- as.factor(y)  
+    class_pred <- as.factor(predict(model.obj,predictors,type="response"))
+    prob_pred <- predict(model.obj,predictors,type="probabilities")[,2]
+    colnames(prob_pred) <- NULL
+    CM <- caret::confusionMatrix(class_pred,observed)
+  } else if(grepl("GLM",model.string)){
+    observed <- as.factor(y)
+    class_pred <- as.factor(predict(model.obj,newx = as.matrix(predictors[,-1]),type="class"))
+    prob_pred <- predict(model.obj,as.matrix(predictors[-c(1)]),type="response")
+    CM <- caret::confusionMatrix(class_pred,observed)
+    # predict(cv_glm,newx = as.matrix(train_data_scaled[,-c(1)]),s=.44,type="response") # Probabilities(of 1)
+    # predict(cv_glm,newx = as.matrix(train_data_scaled[,-c(1)]),s=.44,type="class") # class
+
+  } else if(grepl("NB",model.string)){
+    observed <- as.factor(y)
+    class_pred <- as.factor(as.numeric(predict(model.obj,predictors,type="class"))-1)
+    prob_pred <- predict(model.obj,predictors,type="prob")[,2]
+    CM <- caret::confusionMatrix(class_pred,observed)
+  } else if(grepl("NN3",model.string)){
+    observed <- as.factor(y)  
+    prob_pred <- predict(model.obj,as.matrix(predictors[-c(1)]))[,1]
+    class_pred <- factor(round(predict(model.obj,predictors[-c(1)])[,1]))
+    CM <- caret::confusionMatrix(class_pred,observed)
+  } else if(grepl("NN",model.string)){
+    observed <- as.factor(y)  
+    class_pred <- as.factor(predict(model.obj,predictors,type="class"))
+    prob_pred <- predict(model.obj,predictors,type="raw")[,1]
+    CM <- caret::confusionMatrix(class_pred,observed)
+  }
+  error.vec <- c(CM$overall,CM$byClass,auc_metric = auc(observed,
+                                                        prob_pred))
+  return(list(error.vec,data.frame(prob_1=prob_pred,prob_0=1-prob_pred,class_pred=class_pred,observed=observed) %>% rename(prob_1=1,prob_0=2)))
+} 
+
+# else if(grepl("NN3",model.string)){
+#       observed <- as.factor(y)
+#       predictorsnn3 <- predictors[,-1]
+#       CM <- caret::confusionMatrix(factor(round(predict(model.obj,predictorsnn3)[,1]),levels=c(0,1)),observed)
+#     } else if(grepl("NN",model.string)){
+#       observed <- as.factor(y)
+#       CM <- caret::confusionMatrix(factor(predict(model.obj,newdata=predictors,type="class"),levels=c(0,1)),observed)
+#     } else if(model.string=="GLM"){
+#       # observed <- as.vector(y)
+#       # CM <- caret::confusionMatrix(
+#       #   as.factor(predict(model.obj,
+#       #                     as.matrix(predictors[, -which(colnames(predictors) ==
+#       #                                                     "LPS.Added")]),type="class",s='lambda.min')),
+#       #   as.factor(observed))
+#       observed <- as.factor(y)
+#       CM <- caret::confusionMatrix(as.factor(predict(model.obj,newx = as.matrix(predictors[,-1]),type="class")),
+#                             observed)
+# 
+# roc_auc_fxn <- function(model.string,model.obj,train_data,test.data){
+#   predictions<- bind_rows(generate.errors.ML(model.string,model.obj,train_data)[[2]] %>%
+#     mutate(datatype = "train")%>% 
+#     mutate(auc_metric = as.numeric(auc(observed,prob_1))),
+#     generate.errors.ML(model.string,model.obj,test.data)[[2]] %>%
+#     mutate(datatype = "test")%>% 
+#     mutate(auc_metric = as.numeric(auc(observed,prob_1))))
+#   ) %>% 
+#     mutate(model= model.string) %>% 
+#     select(datatype, auc_metric,model) %>% distinct()
+#   return(predictions)
+# }
+
+
+# model.data <- LPS.model.data
+# nrep <- 2
+train_test_stability.2 <- function(nrep=5,model.data){
+  split.vec <- seq(0,1,by=.02)
+  split.vec <- split.vec[-c(1:5,(length(split.vec)-4):length(split.vec))]
+  # split.vec <- split.vec[c(1,5,10,15)]
+all.models <- vector("list",length(split.vec))
+names(all.models) <- split.vec
+for(i in 1:length(split.vec)){
+  prop=split.vec[i]
+  model.group <- vector("list", nrep)
+  names(model.group) <- 1:nrep
+  message(paste("Starting",split.vec[i]))
+  for(k in 1:nrep){
+    model.obj <- vector("list",4)
+    names(model.obj) <- c("split.index",
+                          "train.scale",
+                          "models",
+                          "errors") 
+    # Train Test Split
+    train_index <- createDataPartition(model.data$LPS.Added,p=prop,list=F)
+    model.obj[["split.index"]] <- train_index
+    # train_data <- model.data[train_index,]
+    # test_data <- model.data[-train_index,]
+    
+    # Scale Data to training data
+    train.min.max <- model.data[train_index,] %>%
+      pivot_longer(!LPS.Added,names_to = "Gene",values_to = "CT_norm1") %>%
+      group_by(Gene) %>%
+      summarise(CTmin=min(CT_norm1),
+                CTmax=max(CT_norm1)) %>%
+      ungroup()
+    model.obj[["train.scale"]] <- train.min.max
+    
+    train_data <- model.data[train_index,] %>%
+      pivot_longer(!LPS.Added,names_to = "Gene",values_to = "CT_norm1") %>%
+      full_join(train.min.max,by="Gene") %>%
+      mutate(CT_scaled=(CT_norm1-CTmin)/(CTmax-CTmin)) %>%
+      mutate(CT_scaled=ifelse(is.finite(CT_scaled),CT_scaled,1)) %>% 
+      select(LPS.Added,Gene,CT_scaled) %>%
+      group_by(Gene) %>%
+      mutate(row_num=row_number()) %>%
+      pivot_wider(names_from="Gene",values_from="CT_scaled") %>%
+      select(-row_num)
+    
+    test_data <- model.data[-train_index,] %>%
+      pivot_longer(!LPS.Added,names_to = "Gene",values_to = "CT_norm1") %>%
+      full_join(train.min.max,by="Gene") %>%
+      mutate(CT_scaled=(CT_norm1-CTmin)/(CTmax-CTmin)) %>%
+      mutate(CT_scaled=ifelse(is.finite(CT_scaled),CT_scaled,1))%>%
+      select(LPS.Added,Gene,CT_scaled) %>%
+      group_by(Gene) %>%
+      mutate(row_num=row_number()) %>%
+      pivot_wider(names_from="Gene",values_from="CT_scaled") %>%
+      select(-row_num)
+    # Train Models 
+    # function(model.string,model.obj,predictors)
+    mods.list <- vector("list", 6)
+    names(mods.list) <- c("rf","nb","svm","glm","nn","nn3")
+    
+    mod.rf <- randomForest(as.factor(LPS.Added)~., data=train_data,
+                           proximity=TRUE,importance=TRUE,ntree=500,keep.forest=TRUE)
+    mods.list[["rf"]] <- mod.rf
+    
+    mod.nb <- naive_bayes(as.logical(LPS.Added) ~ ., data = train_data, usekernel = T, type="raw")
+    mods.list[["nb"]] <- mod.nb
+    
+    mod.svm <-  ksvm(LPS.Added~.,data=train_data,type="C-svc",kernel="vanilladot",prob.model=TRUE,C=.1)
+    mods.list[["svm"]] <- mod.svm
+    
+    # mod.glm <- cv.glmnet(x = as.matrix(train_data[, 
+    #                                               -which(colnames(train_data) == 
+    #                                                        "LPS.Added")]), 
+    #                      y = as.vector(train_data$LPS.Added), 
+    #                      type.measure = "class", 
+    #                      family = "binomial")
+    mod.glm <- glmnet(x=train_data[,-1],
+                   y=as.factor(train_data$LPS.Added),
+                   family = "binomial",lambda = .01)
+    mods.list[["glm"]] <- mod.glm
+
+    mod.nn <- nnet(as.factor(LPS.Added) ~ ., data = train_data ,size=8,linout = FALSE,trace=F,decay=.1)
+    mods.list[["nn"]] <- mod.nn
+    
+    # library(RSNNS)
+    mod.nn3 <- mlp(x=train_data[,-1],
+                   y=train_data$LPS.Added , size = c(80,20,29))
+    mods.list[["nn3"]] <- mod.nn3
+
+    
+    model.obj[["models"]] <- mods.list
+    
+    ## Model Errors
+    error_tab <- function(model.string,model.obj,train_data,test_data){
+      error_train <- generate.errors.ML(model.string,model.obj,predictors=train_data)[[1]] %>% 
+        data.frame(error_val=.) %>% 
+        rownames_to_column(var="error_type") %>% 
+        mutate(split_data="train")
+      error_test <- generate.errors.ML(model.string,model.obj,predictors=test_data)[[1]]%>% 
+        data.frame(error_val=.) %>% rownames_to_column(var="error_type") %>% 
+        mutate(split_data="test")
+      error_mat <- bind_rows(error_train,error_test) %>% mutate(model_type=model.string)
+      return(error_mat)
+    }
+    errors <- bind_rows(error_tab(model.string="RF",model.obj=mod.rf,train_data,test_data),
+                        error_tab(model.string="GLM",model.obj=mod.glm,train_data,test_data),
+                        error_tab(model.string="SVM",model.obj=mod.svm,train_data,test_data),
+                        error_tab(model.string="NN",model.obj=mod.nn,train_data,test_data),
+                        error_tab(model.string="NN3",model.obj=mod.nn3,train_data,test_data),
+                        error_tab(model.string="NB",model.obj=mod.nb,train_data,test_data)) %>% 
+      filter(error_type%in%c("Accuracy","Sensitivity","Specificity","Precision","auc_metric"))
+    model.obj[["errors"]] <- errors
+    # auc <- bind_rows(error_tab(model.string="RF",model.obj=mod.rf,train_data,test_data),
+    #                     error_tab(model.string="GLM",model.obj=mod.glm,train_data,test_data),
+    #                     error_tab(model.string="SVM",model.obj=mod.svm,train_data,test_data),
+    #                     error_tab(model.string="NN",model.obj=mod.nn,train_data,test_data),
+    #                     error_tab(model.string="NN3",model.obj=mod.nn3,train_data,test_data),
+    #                     error_tab(model.string="NB",model.obj=mod.nb,train_data,test_data))
+    # model.obj[["auc"]]
+    # mod.nn
+    # mod.glm
+    # 
+    # Model Errors
+    # model.obj[["model"]] <- mod
+    model.group[[k]] <- model.obj
+    if(k%%25==0){
+      message(paste("Progress",split.vec[i],":",k))
+    }
+  }
+  all.models[[i]] <- model.group
+  # message(paste("Finished",split.vec[i]))
+
+}
+error.data.frame <- data.frame()
+
+for(sp in 1:length(all.models)){
+  error.data.frame <- bind_rows(error.data.frame,bind_rows(purrr::map(all.models[[sp]],~.x[["errors"]] %>%
+                                             mutate(SplitPerc=as.numeric(names(all.models)[sp]))),
+                                .id = "rep"))
+}
+# save(all.models,error.data.frame,model.data,file = paste0("output/traintest_split_stability_",nrep,".RData"))
+return(list(all.models,error.data.frame))
+}
+suppressMessages({
+  run_yn=T
+  save_yn=T
+for(i in 1:20){
+  if(run_yn==T){
+  system.time({
+  output <- train_test_stability.2(nrep=20,model.data = LPS.model.data)
+  })
+  error.data.frame <- output[[2]]
+  if(save_yn==T){
+    write.csv(error.data.frame, 
+              paste0(working.dr,"traintest_split_stability_errordf_trans_addnn3_auc_scaled_20_",i,".csv"),row.names = FALSE)
+    if(i==1){
+      # save(output,file="traintest_split_stability_prot_addnn3_auc_scaled_100_1.RData")
+    }
+  }
+}
+}
+})
+
+
+files <- list.files(working.dr,pattern ="trans_addnn3_auc",full.names = T)
+files <- files[which(grepl(".csv",files))]
+error.data.frame <- data.frame()
+for(i in files){
+  error.data.frame <- bind_rows(error.data.frame,read.csv(i))
+}
+
+ggplot(error.data.frame %>% 
+         mutate(error_type=ifelse(error_type=="auc_metric","AUC",error_type)) %>% 
+         filter(split_data=="test") %>% 
+         group_by(SplitPerc,model_type) %>% 
+         mutate(mean_error=mean(error_val,na.rm=T),
+                sd_error=sd(error_val,na.rm=T),
+                mean_sd_top=min(1,mean_error+sd_error),
+                mean_sd_low=mean_error-sd_error) %>% 
+         ungroup() %>% 
+         filter(SplitPerc>=.1&SplitPerc<=.95),
+       # aes(x=SplitPerc,y=1-error_val))+
+       aes(x=SplitPerc,y=error_val))+
+  geom_point(alpha=.025,size=1)+
+  # geom_line(aes(y=1-mean_error),color="forestgreen",size=2)+
+  geom_line(aes(y=mean_error),color="forestgreen",size=1.5)+
+  # geom_line(aes(y=1-mean_sd_top),color="forestgreen",size=1.5,linetype=3,alpha=.9)+
+  # geom_line(aes(y=1-mean_sd_low),color="forestgreen",size=1.5,linetype=3,alpha=.9)+
+  # geom_ribbon(aes(ymax = 1-mean_sd_low, ymin = 1-mean_sd_top),linetype=2, alpha = 0.25)+
+  # geom_ribbon(aes(ymin = mean_sd_low, ymax = mean_sd_top),linetype=2, alpha = 0.25)+
+  xlab("Training Data Percetage")+
+  ylab("Testing Error")+
+  facet_grid(error_type~model_type)+
+  theme_clean()+ 
+  scale_x_continuous(breaks = seq(0, 1, by = .2),minor_breaks = seq(0, 1, .1))+
+  theme(text = element_text(size=30),
+        axis.title = element_text(size=20),
+        axis.text = element_text(size=15),
+        panel.grid.major.x = element_line(color = "grey80",linetype = 3),
+        )+
+  # coord_cartesian(ylim=c(0,.5),xlim=c(.1,.9))
+  coord_cartesian(ylim=c(.5,1),xlim=c(.1,.9))
+
+library(ggokabeito)
+
+files <- list.files(working.dr,pattern ="prot_addnn3_auc",full.names = T)
+files <- files[which(grepl(".csv",files))]
+error.data.frame.prot <- data.frame()
+for(i in files){
+  error.data.frame.prot <- bind_rows(error.data.frame.prot,read.csv(i))
+}
+error.data.frame.combo <- bind_rows(error.data.frame %>% 
+                                      mutate(DataType = "Transcripts"),
+                                    error.data.frame.prot%>% 
+                                      mutate(DataType = "Protiens"))
+
+error.data.frame.combo %>% filter(error_type=="Accuracy") %>% 
+  filter(split_data=="test") %>% 
+  filter(grepl("NN",model_type)) %>% 
+  group_by(DataType,SplitPerc,model_type) %>% 
+  count(error_val) %>% 
+  mutate(Not100Perc=ifelse(error_val<1,TRUE,FALSE)) %>% 
+  group_by(DataType,SplitPerc,model_type,Not100Perc,group=Not100Perc) %>% 
+  summarise(total_mods=sum(n)) %>% 
+  mutate(prop=ifelse(DataType=="Transcripts",total_mods/500,total_mods/500)) %>% 
+  filter(!Not100Perc) %>% 
+  ggplot(aes(x=SplitPerc,y=prop,color=model_type))+
+  geom_line(size=2)+
+  facet_wrap(DataType~.)+
+  ylab("Proportion of Models")+
+  theme_clean()+ 
+  scale_x_continuous(breaks = seq(0, 1, by = .2),minor_breaks = seq(0, 1, .1))+
+  theme(text = element_text(size=30),
+        axis.title = element_text(size=20),
+        axis.text = element_text(size=15),
+        panel.grid.major.x = element_line(color = "grey80",linetype = 3),
+        )+
+  scale_color_okabe_ito()
+
+```
+
+
+# Hyperparameter Tuning 
+
+##Tune NNET
+```{r NN basic tune size}
+Acc_breaks = c(seq(.5,0.8,length=100),      #for red
+                   seq(0.81,0.95,length=100),  #for white, this puts the key value, 0.05, at the center of the white value range
+                   seq(0.96,1,length=100))  
+
+nnetGrid <-  expand.grid(size = seq(from = 1, to = 11, by = 1),#only goes up to 11 before erroring
+                         decay = sort(c(2:10 %o% 10^(-1:-4),0.0001),decreasing = TRUE)) 
+
+nnetGrid2 <-  expand.grid(size = seq(from = 1, to = 11, by = 1),
+                          decay = c(0,.5,.1,.05,.01,.005,.001,.0005,.0001)) 
+
+#Use predefined reps/folds with unscaled data:####
+nn.pre.mod2.foldsreps <- train(x=train_data[,-1],as.factor(train_data$LPS.Added),
+                    method="nnet",tuneGrid = nnetGrid,trace=FALSE,linout=FALSE,trControl = trainControl(index = foldsreps1))
+nn.pre.mod2.foldsreps$bestTune
+#     size decay
+# 206    8  0.02
+nn.pre.mod2.foldsreps<-readRDS("NN_unscaled_foldsreps_caretOpt.rds")
+
+nn.pre.mod.unscaled.foldsreps.trim <- nn.pre.mod2.foldsreps$results[which(nn.pre.mod2.foldsreps$results$size <= 11),]#Errors at greater than 11
+nn.pre.mod.unscaled.foldsreps.trim <- nn.pre.mod.unscaled.foldsreps.trim[order(nn.pre.mod.unscaled.foldsreps.trim$decay,decreasing = TRUE),]
+
+nn.pre.mod.unscaled.foldsreps.trim$decay.factor <- as.factor(nn.pre.mod.unscaled.foldsreps.trim$decay)
+factors.ordered <- levels(nn.pre.mod.unscaled.foldsreps.trim$decay.factor)[levels(nn.pre.mod.unscaled.foldsreps.trim$decay.factor) %>% as.numeric %>% order(decreasing=FALSE)]
+
+nn.pre.mod2.foldsreps.100 <- nn.pre.mod2.foldsreps$results[which.min(1.0 - nn.pre.mod2.foldsreps$results$Accuracy),] #checking that that is the best
+
+#plot with reordered factor levels:
+NN_unscaled_foldsreps_hm <-ggplot(data = nn.pre.mod.unscaled.foldsreps.trim,mapping=aes(x=size,y=decay.factor,fill=Accuracy))+geom_tile()+
+  scale_fill_gradientn(colours = c("red","white","blue"),values = rescale(Acc_breaks2,to=c(0,1)), limits=c(0.5,1))+
+  #scale_fill_gradient2(low = "red", mid = "white", high = "blue", midpoint = 0.9, breaks = Acc_breaks2,limits = c(0.5,1)) +
+  ylim(factors.ordered)+ylab("NN `decay` values")+xlab("NN # nodes")+scale_x_continuous(breaks=c(1,3,5,7,9,11))+ggtitle("NN with Unscaled Data")+
+          theme_classic()+
+        theme(axis.title.y=element_text(size=14,face="bold"))+
+        theme(axis.title.x=element_text(size=14,face="bold"))+
+      theme(axis.text.x = element_text(size = 10))+
+        theme(axis.text.y = element_text(size = 10))
+
+#saveRDS(nn.pre.mod2.foldsreps,"NN_unscaled_foldsreps_caretOpt.rds")
+#saveRDS(nn.pre.mod2.foldsreps$finalModel,"NN_unscaled_foldsreps_caretBestModel.rds")
+
+#Use predefined reps/folds with scaled data:####
+nn.pre.mod.scaled.foldsreps <- train(x=train_data_scaled[,-1],as.factor(train_data_scaled$LPS.Added),
+                    method="nnet",tuneGrid = nnetGrid,trace=FALSE,linout=FALSE,trControl = trainControl(index = foldsreps1))
+
+nn.pre.mod.scaled.foldsreps$bestTune
+#     size decay
+# 230    7 8e-04
+# ggplot(data = nn.pre.mod.scaled.foldsreps$results,mapping=aes(x=size,y=log10(decay),fill=Accuracy))+geom_tile()+scale_fill_gradientn(colours = c("red","white","blue"),values = rescale(Acc_breaks,to=c(0,1)))
+
+nn.pre.mod.scaled.foldsreps <- readRDS("NN_scaled_foldsreps_caretOpt.rds")
+
+nn.pre.mod.scaled.foldsreps.trim <- nn.pre.mod.scaled.foldsreps$results[which(nn.pre.mod.scaled.foldsreps$results$size <= 11),]#Errors at greater than 11
+nn.pre.mod.scaled.foldsreps.trim <- nn.pre.mod.scaled.foldsreps.trim[order(nn.pre.mod.scaled.foldsreps.trim$decay,decreasing = TRUE),]
+
+ggplot(data = nn.pre.mod.scaled.foldsreps.trim,mapping=aes(x=size,y=as.character(decay),fill=Accuracy))+geom_tile()+scale_fill_gradientn(colours = c("red","white","blue"),values = rescale(Acc_breaks,to=c(0,1)))
+
+nn.pre.mod.scaled.foldsreps.trim$decay.factor <- as.factor(nn.pre.mod.scaled.foldsreps.trim$decay)
+factors.ordered <- levels(nn.pre.mod.scaled.foldsreps.trim$decay.factor)[levels(nn.pre.mod.scaled.foldsreps.trim$decay.factor) %>% as.numeric %>% order(decreasing=FALSE)]
+
+#test on training,testing, and validation data:
+NN.unscaled.checktrain.CM <- confusionMatrix(factor(predict(test.mod.nn,newdata=train_data_scaled[,-which(colnames(train_data_scaled)=="LPS.Added")],type="class"),levels=c(0,1)),as.factor(train_data_scaled$LPS.Added))
+
+#save things
+# saveRDS(nn.pre.mod.scaled.foldsreps,"NN_scaled_foldsreps_caretOpt.rds")
+# saveRDS(nn.pre.mod.scaled.foldsreps$finalModel,"NN_scaled_foldsreps_caretBestModel.rds")
+
+#plot with reordered factor levels:
+NN_scaled_foldsreps_hm <-ggplot(data = nn.pre.mod.scaled.foldsreps.trim,mapping=aes(x=size,y=decay.factor,fill=Accuracy))+geom_tile()+
+  scale_fill_gradientn(colours = c("red","white","blue"),values = rescale(Acc_breaks2,to=c(0,1)), limits=c(0.5,1))+
+  ylim(factors.ordered)+ylab("NN `decay` values")+xlab("NN # nodes")+scale_x_continuous(breaks=c(1,3,5,7,9,11))+ggtitle("NN with Scaled Data")+
+          theme_classic()+
+        theme(axis.title.y=element_text(size=14,face="bold"))+
+        theme(axis.title.x=element_text(size=14,face="bold"))+
+      theme(axis.text.x = element_text(size = 10))+
+        theme(axis.text.y = element_text(size = 10))
+
+```
+
+##Tune Multi-layer Neural net
+```{r nn}
+set.seed(69)
+library(neuralnet)
+
+#caret optimization ####
+nnetGrid1 <-  expand.grid(layer1 = seq(from = 20, to = 100, by = 20),
+                          layer2 = seq(from = 10, to = 60, by = 10)) 
+nnetGrid1p2 <- nnetGrid1[-which(nnetGrid1$layer1 < nnetGrid1$layer2),]
+nnetGrid2 <-  expand.grid(layer1 = seq(from = 20, to = 100, by = 20),
+                          layer2 = seq(from = 10, to = 60, by = 10),
+                          layer3 = seq(from = 5, to = 30, by = 5)) 
+nnetGrid2p2 <- nnetGrid2[-which(nnetGrid2$layer1 < nnetGrid2$layer2 | nnetGrid2$layer2 < nnetGrid2$layer3),]
+nnetGrid3 <-  expand.grid(layer1 = seq(from = 20, to = 100, by = 10),
+                          layer2 = seq(from = 10, to = 60, by = 5),
+                          layer3 = seq(from = 5, to = 30, by = 2)) 
+##Using 3 layers, "neuralnet" package:####
+
+nn2layer.pre.mod.scaled.foldsreps <- train(LPS.Added~.,data=train_data_scaled,
+                    method="neuralnet",threshold = 0.01, err.fct = "sse",tuneGrid = nnetGrid2p2,trControl = trainControl(index = foldsreps1))
+
+nn2layer.pre.mod.scaled.foldsreps$bestTune
+#   layer1 layer2 layer3
+# 1     20     10      5
+##Using 3 layers, "RSNNS" package:####
+library(RSNNS)
+require(devtools)
+library(NeuralNetTools)
+library(data.table)
+###train at default "learnFuncParams" values####
+nn3layer.pre.mod.scaled.foldsreps <- caret::train(x=as.matrix(train_data_scaled[,-which(colnames(train_data_scaled) == "LPS.Added")]),y=as.factor(train_data_scaled$LPS.Added),
+                    method="mlpML",tuneGrid = nnetGrid2p2,trControl = trainControl(index = foldsreps1))
+
+nn3layer.pre.mod.scaled.foldsreps$bestTune
+#     layer1 layer2 layer3
+# 102    100     40     30
+saveRDS(nn3layer.pre.mod.scaled.foldsreps$finalModel,"3LayerNN_scaledtranscripts_foldsreps_smallcaretFinalModel.rds")
+saveRDS(nn3layer.pre.mod.scaled.foldsreps,"3LayerNN_scaledtranscripts_foldsreps_smallcaret.rds")
+
+###train at default "learnFuncParams" values with finer grid#####
+nn3layer2.pre.mod.scaled.foldsreps <- caret::train(x=as.matrix(train_data_scaled[,-which(colnames(train_data_scaled) == "LPS.Added")]),y=as.factor(train_data_scaled$LPS.Added),
+                    method="mlpML",tuneGrid = nnetGrid3,trControl = trainControl(index = foldsreps1))
+
+ nn3layer2.pre.mod.scaled.foldsreps$bestTune
+#     layer1 layer2 layer3
+# 897     80     20     29
+ nn3layer2.pre.mod.scaled.foldsreps$results[897,]
+#     layer1 layer2 layer3  Accuracy     Kappa AccuracySD    KappaSD
+# 897     80     20     29 0.9971429 0.9942857 0.01669328 0.03338657
+saveRDS(nn3layer2.pre.mod.scaled.foldsreps$finalModel,"3LayerNN_scaledtranscripts_foldsreps_largercaretFinalModel.rds")
+saveRDS(nn3layer2.pre.mod.scaled.foldsreps,"3LayerNN_scaledtranscripts_foldsreps_largercaret.rds")
+
+#Train at learnFuncParams = c(0.01,0) (performed well in some pilot tests)
+nn3layer.scaled.foldsreps.LFPp01 <- caret::train(x=as.matrix(train_data_scaled[,-which(colnames(train_data_scaled) == "LPS.Added")]),y=as.factor(train_data_scaled$LPS.Added),
+                    method="mlpML",learnFuncParams=c(0.01,0),tuneGrid = nnetGrid2p2,trControl = trainControl(index = foldsreps1))
+nn3layer.scaled.foldsreps.LFPp01$bestTune
+#     layer1 layer2 layer3
+# 113    100     60     25
+saveRDS(nn3layer.scaled.foldsreps.LFPp01$finalModel,"3LayerNN_scaledtranscripts_foldsreps_LFP01_smallcaretFinalModel.rds")
+saveRDS(nn3layer.scaled.foldsreps.LFPp01,"3LayerNN_scaledtranscripts_foldsreps_LFP01_smallcaret.rds")
+
+
+#Train at learnFuncParams = c(1,0) (performed best in some pilot tests)
+nn3layer.scaled.foldsreps.LFP1 <- caret::train(x=as.matrix(train_data_scaled[,-which(colnames(train_data_scaled) == "LPS.Added")]),y=as.factor(train_data_scaled$LPS.Added),
+                    method="mlpML",learnFuncParams=c(1,0),tuneGrid = nnetGrid2p2,trControl = trainControl(index = foldsreps1))
+nn3layer.scaled.foldsreps.LFP1$bestTune
+#    layer1 layer2 layer3
+# 81     80     60     15
+saveRDS(nn3layer.scaled.foldsreps.LFP1$finalModel,"3LayerNN_scaledtranscripts_foldsreps_LFP1_smallcaretFinalModel.rds")
+saveRDS(nn3layer.scaled.foldsreps.LFP1,"3LayerNN_scaledtranscripts_foldsreps_LFP1_smallcaret.rds")
+
+###exploring importance####
+model.nn3opt.Imp <- data.table(olden(nn3layer.pre.mod.scaled.foldsreps$finalModel,bar_plot = FALSE,out_var='Output_1'),"Gene"=rownames(olden(nn3layer.pre.mod.scaled.foldsreps$finalModel,bar_plot = FALSE,out_var='Output_1')))
+model.nn3opt.Imp <- model.nn3opt.Imp[order(abs(model.nn3opt.Imp$importance),decreasing = T),]
+model.nn3opt.Imp$Gene <- gsub("Input_","",model.nn3opt.Imp$Gene)
+write.csv(model.nn3opt.Imp,"3LayerNN_smallopt_scaledTranscript_OldenImp.csv")
+
+###Try changing the "learnFuncParams" value####
+library(RSNNS)
+model.nn22 <- mlp(train_data_scaled[,-which(colnames(train_data_scaled)=="LPS.Added")], train_data_scaled$LPS.Added, size=c(100,40,30), learnFuncParams=c(1,0), 
+              maxit=50)
+
+model.nn22.results <- predict(model.nn22,test_data_scaled[,-which(colnames(test_data_scaled)=="LPS.Added")])
+compare_nn22 <- data.frame("actual" = test_data_scaled$LPS.Added,"NN_predict3"=model.nn22.results)
+nn22_CM3<-caret::confusionMatrix(as.factor(round(compare_nn22[,2],0)), as.factor(test_data_scaled$LPS.Added))
+nn22_CM3
+#with lower "learFuncParamS"
+model.nn202 <- mlp(train_data_scaled[,-which(colnames(train_data_scaled)=="LPS.Added")], train_data_scaled$LPS.Added, size=c(100,40,30), learnFuncParams=c(0.01,0), 
+              maxit=50)
+
+model.nn202.results <- predict(model.nn202,test_data_scaled[,-which(colnames(test_data_scaled)=="LPS.Added")])
+compare_nn202 <- data.frame("actual" = test_data_scaled$LPS.Added,"NN_predict3"=model.nn202.results)
+nn202_CM3<-caret::confusionMatrix(as.factor(round(compare_nn202[,2],0)), as.factor(test_data_scaled$LPS.Added))
+nn22_CM3
+
+nn3layer.scaled.foldsreps.results <- nn3layer.pre.mod.scaled.foldsreps$results
+
+###plot with reordered factor levels:####
+#default "learnFuncParams" values:
+nn3layer12_scaled_foldsreps_hm <-ggplot(data = nn3layer.pre.mod.scaled.foldsreps$results,mapping=aes(x=layer1,y=layer2,fill=Accuracy))+geom_tile()+
+  scale_fill_gradientn(colours = c("red","white","blue"),values = rescale(Acc_breaks2,to=c(0,1)), limits=c(0.5,1))+
+  #scale_fill_gradient2(low = "red", mid = "white", high = "blue", midpoint = 0.9, breaks = Acc_breaks2,limits = c(0.5,1)) +
+  #ylim(factors.ordered)+
+  ylab("Hidden Notes in Layer2")+
+  xlab("Hidden Notes in Layer1")+
+  #scale_x_continuous(breaks=c(1,3,5,7,9,11))+
+  ggtitle("NN with Scaled Transcript Data")+
+          theme_classic()+
+        theme(axis.title.y=element_text(size=14,face="bold"))+
+        theme(axis.title.x=element_text(size=14,face="bold"))+
+      theme(axis.text.x = element_text(size = 10))+
+        theme(axis.text.y = element_text(size = 10))
+nn3layer12_scaled_foldsreps_hm
+
+#default "learnFuncParams" values with finer grid:
+nn3laye2_r12_scaled_foldsreps_hm <-ggplot(data = nn3layer2.pre.mod.scaled.foldsreps$results,mapping=aes(x=layer1,y=layer2,fill=Accuracy))+geom_tile()+
+  scale_fill_gradientn(colours = c("red","white","blue"),values = rescale(Acc_breaks2,to=c(0,1)), limits=c(0.5,1))+
+  #scale_fill_gradient2(low = "red", mid = "white", high = "blue", midpoint = 0.9, breaks = Acc_breaks2,limits = c(0.5,1)) +
+  #ylim(factors.ordered)+
+  ylab("Hidden Nodes in Layer2")+
+  xlab("Hidden Nodes in Layer1")+
+  #scale_x_continuous(breaks=c(1,3,5,7,9,11))+
+  ggtitle("NN with Scaled Transcript Data")+
+          theme_classic()+
+        theme(axis.title.y=element_text(size=14,face="bold"))+
+        theme(axis.title.x=element_text(size=14,face="bold"))+
+      theme(axis.text.x = element_text(size = 10))+
+        theme(axis.text.y = element_text(size = 10))
+nn3laye2_r12_scaled_foldsreps_hm
+
+nn3laye2_r13_scaled_foldsreps_hm <-ggplot(data = nn3layer2.pre.mod.scaled.foldsreps$results,mapping=aes(x=layer1,y=layer3,fill=Accuracy))+geom_tile()+
+  scale_fill_gradientn(colours = c("red","white","blue"),values = rescale(Acc_breaks2,to=c(0,1)), limits=c(0.5,1))+
+  #scale_fill_gradient2(low = "red", mid = "white", high = "blue", midpoint = 0.9, breaks = Acc_breaks2,limits = c(0.5,1)) +
+  #ylim(factors.ordered)+
+  ylab("Hidden Nodes in Layer3")+
+  xlab("Hidden Nodes in Layer1")+
+  #scale_x_continuous(breaks=c(1,3,5,7,9,11))+
+  ggtitle("NN with Scaled Transcript Data")+
+          theme_classic()+
+        theme(axis.title.y=element_text(size=14,face="bold"))+
+        theme(axis.title.x=element_text(size=14,face="bold"))+
+      theme(axis.text.x = element_text(size = 10))+
+        theme(axis.text.y = element_text(size = 10))
+nn3laye2_r13_scaled_foldsreps_hm
+
+#Changing learnFuncParams to= c(0.01,0) #surprisingly not as good.
+nn3layer.scaled.foldsreps.LFPp01_hm <-ggplot(data = nn3layer.scaled.foldsreps.LFPp01$results,mapping=aes(x=layer1,y=layer2,fill=Accuracy))+geom_tile()+
+  scale_fill_gradientn(colours = c("red","white","blue"),values = rescale(Acc_breaks2,to=c(0,1)), limits=c(0.5,1))+
+  #scale_fill_gradient2(low = "red", mid = "white", high = "blue", midpoint = 0.9, breaks = Acc_breaks2,limits = c(0.5,1)) +
+  #ylim(factors.ordered)+
+  ylab("Hidden Nodes in Layer2")+
+  xlab("Hidden Nodes in Layer1")+
+  #scale_x_continuous(breaks=c(1,3,5,7,9,11))+
+  ggtitle("NN with Scaled Data")+
+          theme_classic()+
+        theme(axis.title.y=element_text(size=14,face="bold"))+
+        theme(axis.title.x=element_text(size=14,face="bold"))+
+      theme(axis.text.x = element_text(size = 10))+
+        theme(axis.text.y = element_text(size = 10))
+
+nn3layer.scaled.foldsreps.LFPp01_hm
+```
+
+
+
+##Tune RF
+```{r RF basic tune size}
+rfGrid <-  expand.grid(mtry = seq(from = 1, to = 40, by = 1))
+
+#Unscaled Using predefined folds/reps with the data:####
+{
+  ##25 trees####
+  rf.pre.mod25.unscaled <- train(x=train_data[,-1],as.factor(train_data$LPS.Added),
+                      method="rf",tuneGrid = rfGrid,
+                      ntree = 25,
+                      trControl = trainControl("repeatedcv", number=5, repeats=50,index = foldsreps1))
+  rf.pre.mod25.unscaled$bestTune
+  #   mtry
+  # 17    17
+  rf.ntree25.unscaled <- rf.pre.mod25.unscaled$results
+  rf.ntree25.unscaled$ntree <- 25
+  rf.caretresults.unscaled <- rf.ntree25.unscaled
+  ##50 trees####
+  rf.pre.mod50.unscaled <- train(x=train_data[,-1],as.factor(train_data$LPS.Added),
+                      method="rf",tuneGrid = rfGrid,
+                      ntree = 50,
+                      trControl = trainControl("repeatedcv", number=5, repeats=50,index = foldsreps1))
+  rf.pre.mod50.unscaled$bestTune
+  #   mtry
+  # 12    12
+  rf.ntree50.unscaled <- rf.pre.mod50.unscaled$results
+  rf.ntree50.unscaled$ntree <- 50
+  rf.caretresults.unscaled <- rbind (rf.caretresults.unscaled,rf.ntree50.unscaled)
+  ##75 trees####
+  rf.pre.mod75.unscaled <- train(x=train_data[,-1],as.factor(train_data$LPS.Added),
+                      method="rf",tuneGrid = rfGrid,
+                      ntree = 75,
+                      trControl = trainControl("repeatedcv", number=5, repeats=50,index = foldsreps1))
+  rf.pre.mod75.unscaled$bestTune
+  #   mtry
+  # 14    14
+  rf.ntree75.unscaled <- rf.pre.mod75.unscaled$results
+  rf.ntree75.unscaled$ntree <- 75
+  rf.caretresults.unscaled <- rbind (rf.caretresults.unscaled,rf.ntree75.unscaled)
+  ##100 trees####
+  rf.pre.mod100.unscaled <- train(x=train_data[,-1],as.factor(train_data$LPS.Added),
+                      method="rf",tuneGrid = rfGrid,
+                      ntree = 100,
+                      trControl = trainControl("repeatedcv", number=5, repeats=50,index = foldsreps1))
+  rf.pre.mod100.unscaled$bestTune
+  #   mtry
+  # 6    6
+  rf.ntree100.unscaled <- rf.pre.mod100.unscaled$results
+  rf.ntree100.unscaled$ntree <- 100
+  rf.caretresults.unscaled <- rbind (rf.caretresults.unscaled,rf.ntree100.unscaled)
+  ##125 trees####
+  rf.pre.mod125.unscaled <- train(x=train_data[,-1],as.factor(train_data$LPS.Added),
+                      method="rf",tuneGrid = rfGrid,
+                      ntree = 125,
+                      trControl = trainControl("repeatedcv", number=5, repeats=50,index = foldsreps1))
+  rf.pre.mod125.unscaled$bestTune
+  #   mtry
+  # 14    14
+  rf.ntree125.unscaled <- rf.pre.mod125.unscaled$results
+  rf.ntree125.unscaled$ntree <- 125
+  rf.caretresults.unscaled <- rbind (rf.caretresults.unscaled,rf.ntree125.unscaled)
+  ##150 trees####
+  rf.pre.mod150.unscaled <- train(x=train_data[,-1],as.factor(train_data$LPS.Added),
+                      method="rf",tuneGrid = rfGrid,
+                      ntree = 150,
+                      trControl = trainControl("repeatedcv", number=5, repeats=50,index = foldsreps1))
+  rf.pre.mod150.unscaled$bestTune
+  #   mtry
+  # 15    15
+  rf.ntree150.unscaled <- rf.pre.mod150.unscaled$results
+  rf.ntree150.unscaled$ntree <- 150
+  rf.caretresults.unscaled <- rbind (rf.caretresults.unscaled,rf.ntree150.unscaled)
+  ##175 trees####
+  rf.pre.mod175.unscaled <- train(x=train_data[,-1],as.factor(train_data$LPS.Added),
+                      method="rf",tuneGrid = rfGrid,
+                      ntree = 175,
+                      trControl = trainControl("repeatedcv", number=5, repeats=50,index = foldsreps1))
+  rf.pre.mod175.unscaled$bestTune
+  #   mtry
+  # 7    7
+  rf.ntree175.unscaled <- rf.pre.mod175.unscaled$results
+  rf.ntree175.unscaled$ntree <- 175
+  rf.caretresults.unscaled <- rbind (rf.caretresults.unscaled,rf.ntree175.unscaled)
+  ##200 trees####
+  rf.pre.mod200.unscaled <- train(x=train_data[,-1],as.factor(train_data$LPS.Added),
+                      method="rf",tuneGrid = rfGrid,
+                      ntree = 200,
+                      trControl = trainControl("repeatedcv", number=5, repeats=50,index = foldsreps1))
+  rf.pre.mod200.unscaled$bestTune
+  #   mtry
+  # 13    13
+  rf.ntree200.unscaled <- rf.pre.mod200.unscaled$results
+  rf.ntree200.unscaled$ntree <- 200
+  rf.caretresults.unscaled <- rbind (rf.caretresults.unscaled,rf.ntree200.unscaled)
+  ##225 trees####
+  rf.pre.mod225.unscaled <- train(x=train_data[,-1],as.factor(train_data$LPS.Added),
+                      method="rf",tuneGrid = rfGrid,
+                      ntree = 225,
+                      trControl = trainControl("repeatedcv", number=5, repeats=50,index = foldsreps1))
+  rf.pre.mod225.unscaled$bestTune
+  #   mtry
+  # 7    7
+  rf.ntree225.unscaled <- rf.pre.mod225.unscaled$results
+  rf.ntree225.unscaled$ntree <- 225
+  rf.caretresults.unscaled <- rbind (rf.caretresults.unscaled,rf.ntree225.unscaled)
+  ##250 trees####
+  rf.pre.mod250.unscaled <- train(x=train_data[,-1],as.factor(train_data$LPS.Added),
+                      method="rf",tuneGrid = rfGrid,
+                      ntree = 250,
+                      trControl = trainControl("repeatedcv", number=5, repeats=50,index = foldsreps1))
+  rf.pre.mod250.unscaled$bestTune
+  #   mtry
+  # 18    18
+  rf.ntree250.unscaled <- rf.pre.mod250.unscaled$results
+  rf.ntree250.unscaled$ntree <- 250
+  rf.caretresults.unscaled <- rbind (rf.caretresults.unscaled,rf.ntree250.unscaled)
+  ##275 trees####
+  rf.pre.mod275.unscaled <- train(x=train_data[,-1],as.factor(train_data$LPS.Added),
+                      method="rf",tuneGrid = rfGrid,
+                      ntree = 275,
+                      trControl = trainControl("repeatedcv", number=5, repeats=50,index = foldsreps1))
+  rf.pre.mod275.unscaled$bestTune
+  #   mtry
+  # 8    8
+  rf.ntree275.unscaled <- rf.pre.mod275.unscaled$results
+  rf.ntree275.unscaled$ntree <- 275
+  rf.caretresults.unscaled <- rbind (rf.caretresults.unscaled,rf.ntree275.unscaled)
+  ##300 trees####
+  rf.pre.mod300.unscaled <- train(x=train_data[,-1],as.factor(train_data$LPS.Added),
+                      method="rf",tuneGrid = rfGrid,
+                      ntree = 300,
+                      trControl = trainControl("repeatedcv", number=5, repeats=50,index = foldsreps1))
+  rf.pre.mod300.unscaled$bestTune
+  #   mtry
+  # 18    18
+  rf.ntree300.unscaled <- rf.pre.mod300.unscaled$results
+  rf.ntree300.unscaled$ntree <- 300
+  rf.caretresults.unscaled <- rbind (rf.caretresults.unscaled,rf.ntree300.unscaled)
+  ##325 trees####
+  rf.pre.mod325.unscaled <- train(x=train_data[,-1],as.factor(train_data$LPS.Added),
+                      method="rf",tuneGrid = rfGrid,
+                      ntree = 325,
+                      trControl = trainControl("repeatedcv", number=5, repeats=50,index = foldsreps1))
+  rf.pre.mod325.unscaled$bestTune
+  #   mtry
+  # 12    12
+  rf.ntree325.unscaled <- rf.pre.mod325.unscaled$results
+  rf.ntree325.unscaled$ntree <- 325
+  rf.caretresults.unscaled <- rbind (rf.caretresults.unscaled,rf.ntree325.unscaled)
+  ##350 trees####
+  rf.pre.mod350.unscaled <- train(x=train_data[,-1],as.factor(train_data$LPS.Added),
+                      method="rf",tuneGrid = rfGrid,
+                      ntree = 350,
+                      trControl = trainControl("repeatedcv", number=5, repeats=50,index = foldsreps1))
+  rf.pre.mod350.unscaled$bestTune
+  #   mtry
+  # 14    14
+  rf.ntree350.unscaled <- rf.pre.mod350.unscaled$results
+  rf.ntree350.unscaled$ntree <- 350
+  rf.caretresults.unscaled <- rbind (rf.caretresults.unscaled,rf.ntree350.unscaled)
+  ##375 trees####
+  rf.pre.mod375.unscaled <- train(x=train_data[,-1],as.factor(train_data$LPS.Added),
+                      method="rf",tuneGrid = rfGrid,
+                      ntree = 375,
+                      trControl = trainControl("repeatedcv", number=5, repeats=50,index = foldsreps1))
+  rf.pre.mod375.unscaled$bestTune
+  #   mtry
+  # 16    16
+  rf.ntree375.unscaled <- rf.pre.mod375.unscaled$results
+  rf.ntree375.unscaled$ntree <- 375
+  rf.caretresults.unscaled <- rbind (rf.caretresults.unscaled,rf.ntree375.unscaled)
+  ##400 trees####
+  rf.pre.mod400.unscaled <- train(x=train_data[,-1],as.factor(train_data$LPS.Added),
+                      method="rf",tuneGrid = rfGrid,
+                      ntree = 400,
+                      trControl = trainControl("repeatedcv", number=5, repeats=50,index = foldsreps1))
+  rf.pre.mod400.unscaled$bestTune
+  #   mtry
+  # 17    17
+  rf.ntree400.unscaled <- rf.pre.mod400.unscaled$results
+  rf.ntree400.unscaled$ntree <- 400
+  rf.caretresults.unscaled <- rbind (rf.caretresults.unscaled,rf.ntree400.unscaled)
+  ##425 trees####
+  rf.pre.mod425.unscaled <- train(x=train_data[,-1],as.factor(train_data$LPS.Added),
+                      method="rf",tuneGrid = rfGrid,
+                      ntree = 425,
+                      trControl = trainControl("repeatedcv", number=5, repeats=50,index = foldsreps1))
+  rf.pre.mod425.unscaled$bestTune
+  #   mtry
+  # 7    7
+  rf.ntree425.unscaled <- rf.pre.mod425.unscaled$results
+  rf.ntree425.unscaled$ntree <- 425
+  rf.caretresults.unscaled <- rbind (rf.caretresults.unscaled,rf.ntree425.unscaled)
+  ##450 trees####
+  rf.pre.mod450.unscaled <- train(x=train_data[,-1],as.factor(train_data$LPS.Added),
+                      method="rf",tuneGrid = rfGrid,
+                      ntree = 450,
+                      trControl = trainControl("repeatedcv", number=5, repeats=50,index = foldsreps1))
+  rf.pre.mod450.unscaled$bestTune
+  #   mtry
+  # 8    8
+  rf.ntree450.unscaled <- rf.pre.mod450.unscaled$results
+  rf.ntree450.unscaled$ntree <- 450
+  rf.caretresults.unscaled <- rbind (rf.caretresults.unscaled,rf.ntree450.unscaled)
+  ##475 trees####
+  rf.pre.mod475.unscaled <- train(x=train_data[,-1],as.factor(train_data$LPS.Added),
+                      method="rf",tuneGrid = rfGrid,
+                      ntree = 475,
+                      trControl = trainControl("repeatedcv", number=5, repeats=50,index = foldsreps1))
+  rf.pre.mod475.unscaled$bestTune
+  #   mtry
+  # 5    5
+  rf.ntree475.unscaled <- rf.pre.mod475.unscaled$results
+  rf.ntree475.unscaled$ntree <- 475
+  rf.caretresults.unscaled <- rbind (rf.caretresults.unscaled,rf.ntree475.unscaled)
+  ##500 trees####
+  rf.pre.mod500.unscaled <- train(x=train_data[,-1],as.factor(train_data$LPS.Added),
+                      method="rf",tuneGrid = rfGrid,
+                      ntree = 500,
+                      trControl = trainControl("repeatedcv", number=5, repeats=50,index = foldsreps1))
+  rf.pre.mod500.unscaled$bestTune
+  #   mtry
+  # 8    8
+  rf.ntree500.unscaled <- rf.pre.mod500.unscaled$results
+  rf.ntree500.unscaled$ntree <- 500
+  rf.caretresults.unscaled <- rbind (rf.caretresults.unscaled,rf.ntree500.unscaled)
+  
+}
+
+  #Plotting####
+  rf.caretresults.unscaled.foldsreps <- rf.caretresults.unscaled
+  rf.caretresults.unscaled.foldsreps$mtry.factor <- as.factor(rf.caretresults.unscaled$mtry)
+  rf.factors.ordered <- levels(rf.caretresults.unscaled.foldsreps$mtry.factor)[levels(rf.caretresults.unscaled.foldsreps$mtry.factor) %>% as.numeric %>% order(decreasing=FALSE)]
+  #plot with reordered factor levels:
+  RF_unscaled_foldsreps_hm <-ggplot(data = rf.caretresults.unscaled.foldsreps,mapping=aes(x=ntree,y=mtry.factor,fill=Accuracy))+geom_tile()+
+    scale_fill_gradientn(colours = c("red","white","blue"),values = rescale(Acc_breaks2,to=c(0,1)), limits=c(0.5,1))+
+    #scale_fill_gradient2(low = "red", mid = "white", high = "blue", midpoint = 0.9, breaks = Acc_breaks2,limits = c(0.5,1)) +
+    ylim(rf.factors.ordered)+ylab("RF 'mtry'")+xlab("RF 'ntree'")+
+    scale_x_continuous(breaks=c(100,200,300,400,500))+
+    ggtitle("RF with Unscaled Data")+
+            theme_classic()+
+        theme(axis.title.y=element_text(size=14,face="bold"))+
+        theme(axis.title.x=element_text(size=14,face="bold"))+
+      theme(axis.text.x = element_text(size = 10))+
+        theme(axis.text.y = element_text(size = 10))
+  
+
+#Scaled Using predefined folds/reps with the data:####
+  {
+  ##25 trees####
+  rf.pre.mod25.scaled <- train(x=train_data_scaled[,-1],as.factor(train_data_scaled$LPS.Added),
+                      method="rf",tuneGrid = rfGrid,
+                      ntree = 25,
+                      trControl = trainControl("repeatedcv", number=5, repeats=50,index = foldsreps1))
+  rf.pre.mod25.scaled$bestTune
+  ##Message - unscaled is worse
+  #   mtry
+  # 19    19
+  rf.caretresults <- rf.pre.mod25.scaled$results
+  rf.caretresults$ntree <- 25
+  ##50 trees####
+  rf.pre.mod50.scaled <- train(x=train_data_scaled[,-1],as.factor(train_data_scaled$LPS.Added),
+                      method="rf",tuneGrid = rfGrid,
+                      ntree = 50,
+                      trControl = trainControl("repeatedcv", number=5, repeats=50,index = foldsreps1))
+  rf.pre.mod50.scaled$bestTune
+  #   mtry
+  # 23    23
+  rf.ntree50 <- rf.pre.mod50.scaled$results
+  rf.ntree50$ntree <- 50
+  rf.caretresults <- rbind (rf.caretresults,rf.ntree50)
+  ##75 trees####
+  rf.pre.mod75.scaled <- train(x=train_data_scaled[,-1],as.factor(train_data_scaled$LPS.Added),
+                      method="rf",tuneGrid = rfGrid,
+                      ntree = 75,
+                      trControl = trainControl("repeatedcv", number=5, repeats=50,index = foldsreps1))
+  rf.pre.mod75.scaled$bestTune
+  #   mtry
+  # 8    8
+  rf.ntree75 <- rf.pre.mod75.scaled$results
+  rf.ntree75$ntree <- 75
+  rf.caretresults <- rbind (rf.caretresults,rf.ntree75)
+  ##100 trees####
+  rf.pre.mod100.scaled <- train(x=train_data_scaled[,-1],as.factor(train_data_scaled$LPS.Added),
+                      method="rf",tuneGrid = rfGrid,
+                      ntree = 100,
+                      trControl = trainControl("repeatedcv", number=5, repeats=50,index = foldsreps1))
+  rf.pre.mod100.scaled$bestTune
+  #   mtry
+  # 16    16
+  rf.ntree100 <- rf.pre.mod100.scaled$results
+  rf.ntree100$ntree <- 100
+  rf.caretresults <- rbind (rf.caretresults,rf.ntree100)
+  ##125 trees####
+  rf.pre.mod125.scaled <- train(x=train_data_scaled[,-1],as.factor(train_data_scaled$LPS.Added),
+                      method="rf",tuneGrid = rfGrid,
+                      ntree = 125,
+                      trControl = trainControl("repeatedcv", number=5, repeats=50,index = foldsreps1))
+  rf.pre.mod125.scaled$bestTune
+  #   mtry
+  # 8    8
+  rf.ntree125 <- rf.pre.mod125.scaled$results
+  rf.ntree125$ntree <- 125
+  rf.caretresults <- rbind (rf.caretresults,rf.ntree125)
+  ##150 trees####
+  rf.pre.mod150.scaled <- train(x=train_data_scaled[,-1],as.factor(train_data_scaled$LPS.Added),
+                      method="rf",tuneGrid = rfGrid,
+                      ntree = 150,
+                      trControl = trainControl("repeatedcv", number=5, repeats=50,index = foldsreps1))
+  rf.pre.mod150.scaled$bestTune
+  #   mtry
+  # 15    15
+  rf.ntree150 <- rf.pre.mod150.scaled$results
+  rf.ntree150$ntree <- 150
+  rf.caretresults <- rbind (rf.caretresults,rf.ntree150)
+  ##175 trees####
+  rf.pre.mod175.scaled <- train(x=train_data_scaled[,-1],as.factor(train_data_scaled$LPS.Added),
+                      method="rf",tuneGrid = rfGrid,
+                      ntree = 175,
+                      trControl = trainControl("repeatedcv", number=5, repeats=50,index = foldsreps1))
+  rf.pre.mod175.scaled$bestTune
+  #   mtry
+  # 11    11
+  rf.ntree175 <- rf.pre.mod175.scaled$results
+  rf.ntree175$ntree <- 175
+  rf.caretresults <- rbind (rf.caretresults,rf.ntree175)
+  ##200 trees####
+  rf.pre.mod200.scaled <- train(x=train_data_scaled[,-1],as.factor(train_data_scaled$LPS.Added),
+                      method="rf",tuneGrid = rfGrid,
+                      ntree = 200,
+                      trControl = trainControl("repeatedcv", number=5, repeats=50,index = foldsreps1))
+  rf.pre.mod200.scaled$bestTune
+  #   mtry
+  # 14    14
+  rf.ntree200 <- rf.pre.mod200.scaled$results
+  rf.ntree200$ntree <- 200
+  rf.caretresults <- rbind (rf.caretresults,rf.ntree200)
+  ##225 trees####
+  rf.pre.mod225.scaled <- train(x=train_data_scaled[,-1],as.factor(train_data_scaled$LPS.Added),
+                      method="rf",tuneGrid = rfGrid,
+                      ntree = 225,
+                      trControl = trainControl("repeatedcv", number=5, repeats=50,index = foldsreps1))
+  rf.pre.mod225.scaled$bestTune
+  #   mtry
+  # 11    11
+  rf.ntree225 <- rf.pre.mod225.scaled$results
+  rf.ntree225$ntree <- 225
+  rf.caretresults <- rbind (rf.caretresults,rf.ntree225)
+  ##250 trees####
+  rf.pre.mod250.scaled <- train(x=train_data_scaled[,-1],as.factor(train_data_scaled$LPS.Added),
+                      method="rf",tuneGrid = rfGrid,
+                      ntree = 250,
+                      trControl = trainControl("repeatedcv", number=5, repeats=50,index = foldsreps1))
+  rf.pre.mod250.scaled$bestTune
+  #   mtry
+  # 6    6
+  rf.ntree250 <- rf.pre.mod250.scaled$results
+  rf.ntree250$ntree <- 250
+  rf.caretresults <- rbind (rf.caretresults,rf.ntree250)
+  ##275 trees####
+  rf.pre.mod275.scaled <- train(x=train_data_scaled[,-1],as.factor(train_data_scaled$LPS.Added),
+                      method="rf",tuneGrid = rfGrid,
+                      ntree = 275,
+                      trControl = trainControl("repeatedcv", number=5, repeats=50,index = foldsreps1))
+  rf.pre.mod275.scaled$bestTune
+  #   mtry
+  # 9    9
+  rf.ntree275 <- rf.pre.mod275.scaled$results
+  rf.ntree275$ntree <- 275
+  rf.caretresults <- rbind (rf.caretresults,rf.ntree275)
+  ##300 trees####
+  rf.pre.mod300.scaled <- train(x=train_data_scaled[,-1],as.factor(train_data_scaled$LPS.Added),
+                      method="rf",tuneGrid = rfGrid,
+                      ntree = 300,
+                      trControl = trainControl("repeatedcv", number=5, repeats=50,index = foldsreps1))
+  rf.pre.mod300.scaled$bestTune
+  #   mtry
+  # 9    9
+  rf.ntree300 <- rf.pre.mod300.scaled$results
+  rf.ntree300$ntree <- 300
+  rf.caretresults <- rbind (rf.caretresults,rf.ntree300)
+  ##325 trees####
+  rf.pre.mod325.scaled <- train(x=train_data_scaled[,-1],as.factor(train_data_scaled$LPS.Added),
+                      method="rf",tuneGrid = rfGrid,
+                      ntree = 325,
+                      trControl = trainControl("repeatedcv", number=5, repeats=50,index = foldsreps1))
+  rf.pre.mod325.scaled$bestTune
+  #   mtry
+  # 15    15
+  rf.ntree325 <- rf.pre.mod325.scaled$results
+  rf.ntree325$ntree <- 325
+  rf.caretresults <- rbind (rf.caretresults,rf.ntree325)
+  ##350 trees####
+  rf.pre.mod350.scaled <- train(x=train_data_scaled[,-1],as.factor(train_data_scaled$LPS.Added),
+                      method="rf",tuneGrid = rfGrid,
+                      ntree = 350,
+                      trControl = trainControl("repeatedcv", number=5, repeats=50,index = foldsreps1))
+  rf.pre.mod350.scaled$bestTune
+  #   mtry
+  # 10    10
+  rf.ntree350 <- rf.pre.mod350.scaled$results
+  rf.ntree350$ntree <- 350
+  rf.caretresults <- rbind (rf.caretresults,rf.ntree350)
+  ##375 trees####
+  rf.pre.mod375.scaled <- train(x=train_data_scaled[,-1],as.factor(train_data_scaled$LPS.Added),
+                      method="rf",tuneGrid = rfGrid,
+                      ntree = 375,
+                      trControl = trainControl("repeatedcv", number=5, repeats=50,index = foldsreps1))
+  rf.pre.mod375.scaled$bestTune
+  #   mtry
+  # 11    11
+  rf.ntree375 <- rf.pre.mod375.scaled$results
+  rf.ntree375$ntree <- 375
+  rf.caretresults <- rbind (rf.caretresults,rf.ntree375)
+  ##400 trees####
+  rf.pre.mod400.scaled <- train(x=train_data_scaled[,-1],as.factor(train_data_scaled$LPS.Added),
+                      method="rf",tuneGrid = rfGrid,
+                      ntree = 400,
+                      trControl = trainControl("repeatedcv", number=5, repeats=50,index = foldsreps1))
+  rf.pre.mod400.scaled$bestTune
+  #   mtry
+  # 14    14
+  rf.ntree400 <- rf.pre.mod400.scaled$results
+  rf.ntree400$ntree <- 400
+  rf.caretresults <- rbind (rf.caretresults,rf.ntree400)
+  ##425 trees####
+  rf.pre.mod425.scaled <- train(x=train_data_scaled[,-1],as.factor(train_data_scaled$LPS.Added),
+                      method="rf",tuneGrid = rfGrid,
+                      ntree = 425,
+                      trControl = trainControl("repeatedcv", number=5, repeats=50,index = foldsreps1))
+  rf.pre.mod425.scaled$bestTune
+  #   mtry
+  # 19    19
+  rf.ntree425 <- rf.pre.mod425.scaled$results
+  rf.ntree425$ntree <- 425
+  rf.caretresults <- rbind (rf.caretresults,rf.ntree425)
+  ##450 trees####
+  rf.pre.mod450.scaled <- train(x=train_data_scaled[,-1],as.factor(train_data_scaled$LPS.Added),
+                      method="rf",tuneGrid = rfGrid,
+                      ntree = 450,
+                      trControl = trainControl("repeatedcv", number=5, repeats=50,index = foldsreps1))
+  rf.pre.mod450.scaled$bestTune
+  #   mtry
+  # 7    7
+  rf.ntree450 <- rf.pre.mod450.scaled$results
+  rf.ntree450$ntree <- 450
+  rf.caretresults <- rbind (rf.caretresults,rf.ntree450)
+  ##475 trees####
+  rf.pre.mod475.scaled <- train(x=train_data_scaled[,-1],as.factor(train_data_scaled$LPS.Added),
+                      method="rf",tuneGrid = rfGrid,
+                      ntree = 475,
+                      trControl = trainControl("repeatedcv", number=5, repeats=50,index = foldsreps1))
+  rf.pre.mod475.scaled$bestTune
+  #   mtry
+  # 5    5
+  
+  rf.ntree475 <- rf.pre.mod475.scaled$results
+  rf.ntree475$ntree <- 475
+  rf.caretresults <- rbind (rf.caretresults,rf.ntree475)
+  ##500 trees####
+  rf.pre.mod500.scaled <- train(x=train_data_scaled[,-1],as.factor(train_data_scaled$LPS.Added),
+                      method="rf",tuneGrid = rfGrid,
+                      ntree = 500,
+                      trControl = trainControl("repeatedcv", number=5, repeats=50,index = foldsreps1))
+  rf.pre.mod500.scaled$bestTune
+  #   mtry
+  # 4    4
+  rf.ntree500 <- rf.pre.mod500.scaled$results
+  rf.ntree500$ntree <- 500
+  rf.caretresults <- rbind (rf.caretresults,rf.ntree500)
+  
+  }
+  #Plotting things:####
+  rf.caretresults.scaled.foldsreps <- rf.caretresults
+  rf.caretresults.scaled.foldsreps$mtry.factor <- as.factor(rf.caretresults$mtry)
+  rf.factors.ordered <- levels(rf.caretresults.scaled.foldsreps$mtry.factor)[levels(rf.caretresults.scaled.foldsreps$mtry.factor) %>% as.numeric %>% order(decreasing=FALSE)]
+    
+  
+  #plot with reordered factor levels:
+  RF_scaled_foldsreps_hm <-ggplot(data = rf.caretresults.scaled.foldsreps,mapping=aes(x=ntree,y=mtry.factor,fill=Accuracy))+geom_tile()+
+    scale_fill_gradientn(colours = c("red","white","blue"),values = rescale(Acc_breaks2,to=c(0,1)), limits=c(0.5,1))+
+    #scale_fill_gradient2(low = "red", mid = "white", high = "blue", midpoint = 0.9, breaks = Acc_breaks2,limits = c(0.5,1)) +
+    ylim(rf.factors.ordered)+ylab("RF 'mtry'")+xlab("RF 'ntree'")+
+    #scale_x_continuous(breaks=c(1,3,5,7,9,11))+
+    ggtitle("RF with Scaled Data")+
+            theme_classic()+
+        theme(axis.title.y=element_text(size=14,face="bold"))+
+        theme(axis.title.x=element_text(size=14,face="bold"))+
+      theme(axis.text.x = element_text(size = 10))+
+        theme(axis.text.y = element_text(size = 10))
+  
+```
+##Tune GLM
+```{r GLM basic tune}
+# glm.pre.mod <- cv.glmnet(x=as.matrix(LPS.model.data[,
+#                                           -which(colnames(LPS.model.data) ==
+#                                                      "LPS.Added")]),
+#                    y = as.vector(LPS.model.data$LPS.Added),family = "binomial",type.measure = "class",
+#                    lambda=c(1, 5e-1,1e-1,5e-2,1e-2,5e-3,1e-3,5e-4,1e-4,5e-5,1e-5))
+glm_grid=expand.grid(lambda=sort(c(2:10 %o% 10^(-1:-4),0.0001),decreasing = TRUE),
+                     alpha=c(1, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1,0))
+
+glm_grid2=expand.grid(lambda=c(1, 5e-1,1e-1,5e-2,1e-2,5e-3,1e-3,5e-4,1e-4,5e-5,1e-5),
+                     alpha=c(1, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1,0))
+#Unscaled using definedfoldsreps####
+runglm = F
+if(runglm == T){
+  glm.pre.mod.unscaled.foldsreps <- train(x=train_data[,-c(1)],y=as.factor(train_data$LPS.Added),trControl = trainControl(index = foldsreps1),method="glmnet",family="binomial",tuneGrid=glm_grid)
+results.df.trunc <- data.frame(lambda=as.numeric(glm.pre.mod.unscaled.foldsreps$results$lambda),
+                               alpha=as.numeric(glm.pre.mod.unscaled.foldsreps$results$alpha),
+                               Accuracy=as.numeric(glm.pre.mod.unscaled.foldsreps$results$Accuracy))
+}else{
+  glm.pre.mod.unscaled.foldsreps <- readRDS("GLMNET_unscaled_foldsreps_caretOpt.rds")
+}
+
+glm.pre.mod.unscaled.foldsreps$bestTune
+#     alpha lambda
+# 399     1    0.2
+glm.pre.mod.unscaled.foldsreps.df <- glm.pre.mod.unscaled.foldsreps$results
+
+glm.pre.mod.unscaled.foldsreps.df$lambda.factor <- as.factor(glm.pre.mod.unscaled.foldsreps.df$lambda)
+lambda.factors.ordered <- levels(glm.pre.mod.unscaled.foldsreps.df$lambda.factor)[levels(glm.pre.mod.unscaled.foldsreps.df$lambda.factor) %>% as.numeric %>% order(decreasing=FALSE)]
+
+# saveRDS(glm.pre.mod.unscaled.foldsreps,"GLMNET_unscaled_foldsreps_caretOpt.rds")
+# saveRDS(glm.pre.mod.unscaled.foldsreps$finalModel,"GLMNET_unscaled_foldsreps_caretBestModel.rds")
+glm.pre.mod.unscaled.foldsreps <- readRDS("GLMNET_unscaled_foldsreps_caretOpt.rds")
+
+
+#Scaled Using Folds/Reps####
+runglm_scaled = F
+if(runglm_scaled == T){
+  glm.pre.mod.scaled.foldsreps <- train(x=train_data_scaled[,-c(1)],y=as.factor(train_data_scaled$LPS.Added),trControl = trainControl(index = foldsreps1),method="glmnet",family="binomial",tuneGrid=glm_grid)
+  
+  #saveRDS(glm.pre.mod.scaled.foldsreps,"GLMNET_scaled_foldsreps_caretOpt.rds")
+#saveRDS(glm.pre.mod.scaled.foldsreps$finalModel,"GLMNET_scaled_foldsreps_caretBestModel.rds")
+}else{
+  glm.pre.mod.scaled.foldsreps <- readRDS("GLMNET_scaled_foldsreps_caretOpt.rds")
+}
+
+
+glm.pre.mod.scaled.foldsreps$bestTune
+#     alpha lambda
+# 399     1    0.2
+#     alpha lambda
+# 318   0.8   0.04
+glm.pre.mod.scaled.foldsreps.df <- glm.pre.mod.scaled.foldsreps$results
+
+glm.pre.mod.scaled.foldsreps.df$lambda.factor <- as.factor(glm.pre.mod.scaled.foldsreps.df$lambda)
+lambda.factors.ordered <- levels(glm.pre.mod.scaled.foldsreps.df$lambda.factor)[levels(glm.pre.mod.scaled.foldsreps.df$lambda.factor) %>% as.numeric %>% order(decreasing=FALSE)]
+
+###Load Katy's previous folds/reps ####
+foldsreps1 <- readRDS("index_save_5_50.rds")
+foldsreps1.df <- data.frame(foldsreps1)
+foldsrep1.df.1 <- foldsreps1.df[,1:50]
+foldsrep1.df.2 <- foldsreps1.df[,51:100]
+foldsrep1.df.3 <- foldsreps1.df[,101:150]
+foldsrep1.df.4 <- foldsreps1.df[,151:200]
+foldsrep1.df.5 <- foldsreps1.df[,201:250]
+
+### Use the caret package to optimize pairs of alpha and lambda for an elastic net:####
+model.net <- train(as.factor(LPS.Added) ~., data = train_data_scaled, method = "glmnet",trControl = trainControl("cv", number = 10),family="binomial",tuneLength = 100)
+
+model.net$bestTune #picks: alpha= 0.1, lambda = 0.7067319 (0.5487302 when seed is 400)
+coef.opt <- as.data.frame(as.matrix(coef(model.net$finalModel, s=model.net$bestTune$lambda))[-1,])
+colnames(coef.opt) <- "coefs"
+coef.opt$vars <- rownames(coef.opt)
+coef.opt.nz <-  coef.opt[which(coef.opt$coefs !=0),]
+coef.opt.nz.ordered <- as.data.frame(coef.opt.nz[order(abs(coef.opt.nz$coefs),decreasing = TRUE),])
+
+confusionMatrix(as.factor(round(predict(model.net$finalModel,as.matrix(test_data_scaled[,-which(colnames(test_data_scaled)=="LPS.Added")]),s=model.net$bestTune$lambda,type="response"),0)),as.factor(test_data_scaled$LPS.Added))
+
+saveRDS(model.net,"GLMNET_caretopt.rds")
+
+### Graph Results from caret optimization, pick/test alternative parameter values####
+#Check selected optimal pair, but from plots, looks like would want to pick alpha < 0.4, lambda < 0.3 (< 0.2 for seed of 400)
+scatterplot3d(model.net$results$alpha,model.net$results$lambda,model.net$results$Accuracy, angle = 55)
+plot(model.net$results$alpha,model.net$results$Accuracy)
+plot(model.net$results$lambda,model.net$results$Accuracy)
+
+#From plot, pick an alpha/labmda pair and test:
+lambda.select <- model.net$results$lambda[which.min(abs(0.2-model.net$results$lambda[which(model.net$results$alpha == 0.4)]))]
+
+test3 <- glmnet(as.matrix(train_data_scaled[,-which(colnames(train_data_scaled)=="LPS.Added")]),as.vector(train_data_scaled$LPS.Added),family="binomial",alpha = 0.4)
+coef.test3 <- as.data.frame(as.matrix(coef(test3, s=lambda.select))[-1,]) #works very well when the seed is set at 400
+colnames(coef.test3) <- "coefs"
+coef.test3$vars <- rownames(coef.test3)
+coef.test3.nz <-  coef.test3[which(coef.test3$coefs !=0),]
+coef.test3.nz.ordered <- as.data.frame(coef.test3.nz[order(abs(coef.test3.nz$coefs),decreasing = TRUE),])
+
+confusionMatrix(as.factor(round(predict(test3,as.matrix(test_data_scaled[,-which(colnames(test_data_scaled)=="LPS.Added")]),s=lambda.select,type="response"),0)),as.factor(test_data_scaled$LPS.Added))
+
+#Seed = 1306, alpha = 0.4, lambda = 0.2971783
+#             coefs  vars
+# CCL5  -2.72132867  CCL5
+# CXCL2 -1.46181320 CXCL2
+# LTB   -1.29510708   LTB
+# CXCL1 -1.24846110 CXCL1
+# IL6   -0.55479476   IL6
+# CCL2  -0.52960891  CCL2
+# CSF3  -0.47984552  CSF3
+# CCL20 -0.47331357 CCL20
+# CXCL5 -0.34464967 CXCL5
+# VEGFA  0.09518796 VEGFA
+# IL18   0.09423151  IL18
+# BMP4   0.07277107  BMP4
+
+#Seed = 1306, alpha = 0.4, lambda = 0.1971511
+#              coefs  vars
+# CCL5  -2.750503622  CCL5
+# CXCL2 -1.470014044 CXCL2
+# LTB   -1.306445001   LTB
+# CXCL1 -1.257973509 CXCL1
+# IL6   -0.562318756   IL6
+# CCL2  -0.535858976  CCL2
+# CSF3  -0.483224198  CSF3
+# CCL20 -0.477447402 CCL20
+# CXCL5 -0.346694101 CXCL5
+# VEGFA  0.106058884 VEGFA
+# IL18   0.102073710  IL18
+# BMP4   0.084644078  BMP4
+# IL22   0.005629512  IL22
+# IL1B  -0.004392623  IL1B
+
+#Seed = 400
+#           coefs  vars
+# CCL5  -2.7268124  CCL5
+# CXCL2 -1.5044520 CXCL2
+# CXCL1 -1.4203935 CXCL1
+# IL6   -0.6712120   IL6
+# CCL20 -0.6167762 CCL20
+# LTB   -0.6116767   LTB
+# CCL2  -0.4302746  CCL2
+# CSF3  -0.2097995  CSF3
+# CXCL8 -0.2048959 CXCL8
+
+
+### Custom glmnet function to use given folds, optimize lambda values over repeats ####
+glmnet.lambdaopt <- function(x,y, testx=NULL,testy=NULL,repeats = 50, folds = 5,foldsreps = foldsreps1.df,alpha.set=0.4,lambdas = c(seq(0.000001,0.000009,0.000001),seq(0.00001,0.00009,0.00001),seq(0.0001,0.0009,0.0001),seq(0.001,0.009,0.0002),seq(0.01,0.09,0.002),seq(0.1,0.9,0.02))){
+  lambdas = lambdas[order(lambdas,decreasing = TRUE)]
+  modelinfo <- NULL
+  varimp <- vector(mode='list', length=repeats)
+  varimp.scaled <- vector(mode='list', length=repeats)
+  models <- vector(mode='list', length=repeats)
+  #colnames(results) <- c("Variables","VariablesSD","Accuracy","AccuracySD","Kappa","KappaSD","NonZeroCoeffs","NonZeroCoeffsSD")
+  
+    #structuring input data (because some of the algorithms take x and y as part of a dataframe, others as two separate arguments)
+  data <- x
+  data$y <- y
+  
+   #If testing data is given, structuring test data (because some of the algorithms take x and y as part of a dataframe, others as two separate arguments)
+  if(!is.null(testx) || !is.null(testy)){
+    testing <- testx
+    testing$y <- testy
+  }
+  
+  FoldAccuracies <- data.frame(matrix(ncol=length(sizes),nrow=repeats*folds))
+  colnames(FoldAccuracies) <- sizes
+  allcoefs<- data.frame("var"=colnames(x))
+  allcoefs.scaled<- data.frame("var"=colnames(x))
+  for(k in 1:repeats){
+    varimp[[k]] <- vector(mode='list', length=folds)
+    varimp.scaled[[k]] <- vector(mode='list', length=folds)
+    models[[k]] <- vector(mode='list', length=folds)
+    kcoefs <- data.frame("var"=colnames(x))
+    kcoefs.scaled <- data.frame("var"=colnames(x))
+    for(j in 1:folds){
+        varimp[[k]][[j]] <- vector(mode='list', length=length(lambdas))
+        varimp.scaled[[k]][[j]] <- vector(mode='list', length=length(lambdas))
+        models[[k]][[j]] <- vector(mode='list', length=length(lambdas))
+        jfoldindex <- foldsreps[,(k-1)*5 + j] #Folds/Reps are ordered by Reps and then by folds.
+        jtrain_data <- data[jfoldindex,]
+        jtest_data <- data[-jfoldindex,]
+        
+      newentry <- data.frame(matrix(ncol=4,nrow=length(lambdas)))
+      colnames(newentry) <- c("Lambda","Accuracy","Kappa","NonZeroCoeffs")
+      jcoefs <- data.frame("var"=colnames(x))
+      jcoefs.scaled <- data.frame("var"=colnames(x))
+    
+      
+      imodel <- glmnet(x = as.matrix(jtrain_data[,-which(colnames(jtrain_data)=="y")]),y=as.vector(jtrain_data$y),family = "binomial",lambda = lambdas,alpha = alpha.set) #The glmnet fits a model at each value of lambda. We will then pull out this model at each value.
+      models[[k]][[j]]<- imodel
+      
+      for(i in 1:length(lambdas)){
+        check <- confusionMatrix(as.factor(round(predict(imodel,newx=as.matrix(jtest_data[,-which(colnames(jtest_data)=="y")]),type="response",s=lambdas[i]),0)),as.factor(jtest_data$y))
+      
+       newentry$Lambda[i] <- lambdas[i]
+       newentry$Accuracy[i] <- check$overall["Accuracy"]
+       newentry$Kappa[i] <- check$overall["Kappa"]
+      
+      coefs <- as.data.frame(as.matrix((coef(imodel,s=lambdas[i]))))
+      coefs2 <- coefs[rownames(coefs) != "(Intercept)",]
+      names(coefs2) <- rownames(coefs)[rownames(coefs)!= "(Intercept)"]
+      coefs2[is.na(coefs2)] <- 0
+      vimp <- data.frame( unname(coefs2), var = names(coefs2))
+      colnames(vimp)[1]<-paste0("Lambda",lambdas[i],".",k,".",j)
+      rownames(vimp) <- names(coefs2)
+      vimp <- vimp[order(abs(vimp[,1]), decreasing = TRUE), , drop = FALSE]
+      vimpscaled <- vimp
+      vimpscaled[,1] <- as.numeric(abs(vimpscaled[,1])/max(abs(vimpscaled[,1])))
+      iNZs <- which(vimpscaled[,1] != 0)
+      
+      newentry$NonZeroCoeffs[i] <- length(iNZs)
+      
+      #Save variable importance and model structure for each model
+      varimp[[k]][[j]][[i]] <- vimp
+      varimp.scaled[[k]][[j]][[i]] <- vimpscaled
+
+      # #Save each model accuracy and kappa
+      # models[[k]][[j]][[i]]$AccFold <- check$overall["Accuracy"]
+      # models[[k]][[j]][[i]]$Kappa <- check$overall["Kappa"]
+      # models[[k]][[j]][[i]]$NonZeroCoeff <- length(iNZs)
+      
+      joined <- left_join(jcoefs,vimp,by="var")
+      jcoefs <- joined
+      
+      joined.scaled <- left_join(jcoefs.scaled,vimpscaled,by="var")
+      jcoefs.scaled <- vimpscaled
+      }
+      newkcoefs <- left_join(kcoefs,jcoefs,by="var")
+      kcoefs <- newkcoefs
+      
+      newkcoefs.scaled <- left_join(kcoefs.scaled,jcoefs.scaled,by="var")
+      kcoefs.scaled <- newkcoefs.scaled
+      
+      modelinfo <- rbind(modelinfo,newentry)
+    }
+    newallcoefs <- left_join(allcoefs,kcoefs,by="var")
+    allcoefs <- newallcoefs
+    
+    newallcoefs.scaled <- left_join(allcoefs.scaled,kcoefs.scaled,by="var")
+    allcoefs.scaled <- newallcoefs.scaled
+  }
+  lambdamods.df <- data.frame(matrix(nrow=length(lambdas),ncol=5))
+  colnames(lambdamods.df) <- c("Lambda","AccAve","AccSD","NVarAve","NVarSD")
+  for(i in 1:length(lambdas)){
+    ilambdainfo <- modelinfo[which(modelinfo$Lambda == lambdas[i]),]
+    AvgInfo <- MeanSD(ilambdainfo)
+    aveinfo2 <- data.frame("Ave" = AvgInfo[1:(length(AvgInfo)/2)],"SD" =AvgInfo[(length(AvgInfo)/2 + 1):length(AvgInfo)])
+    lambdamods.df$Lambda[i] <- lambdas[i]
+    lambdamods.df$AccAve[i] <- aveinfo2$Ave[which(rownames(aveinfo2)=="Accuracy")]
+    lambdamods.df$AccSD[i] <- aveinfo2$SD[which(rownames(aveinfo2)=="Accuracy")]
+    lambdamods.df$NVarAve[i] <- aveinfo2$Ave[which(rownames(aveinfo2)=="NonZeroCoeffs")]
+    lambdamods.df$NVarSD[i] <- aveinfo2$SD[which(rownames(aveinfo2)=="NonZeroCoeffs")]
+  }
+  #Use coeff values to determine importance order in unscaled coefficients
+  allcoefs2 <- allcoefs
+  rownames(allcoefs2) <- allcoefs$var
+  allcoefs2 <- allcoefs2[,-which(colnames(allcoefs2)=="var")]
+  AvgCoeffs <- data.frame("Ave" = rowSums(allcoefs2)/ncol(allcoefs2), "SD" = apply(allcoefs2,1,sd))
+  AvgCoeffs <- AvgCoeffs[order(abs(AvgCoeffs$Ave),decreasing = TRUE),]
+  
+  #Use coeff values to determine importance order in SCALED coefficients
+  allcoefs2.scaled <- allcoefs.scaled
+  rownames(allcoefs2.scaled) <- allcoefs.scaled$var
+  allcoefs2.scaled <- allcoefs2.scaled[,-which(colnames(allcoefs2.scaled)=="var")]
+  AvgCoeffs.scaled <- data.frame("Ave" = rowSums(allcoefs2.scaled)/ncol(allcoefs2.scaled), "SD" = apply(allcoefs2.scaled,1,sd))
+  AvgCoeffs.scaled <- AvgCoeffs.scaled[order(abs(AvgCoeffs.scaled$Ave),decreasing = TRUE),]
+  
+#Pick the optimal value of labmda
+lambda.opt <- lambdamods.df$Lambda[which(lambdamods.df$AccAve == max(lambdamods.df$AccAve))]
+if(length(lambda.opt) > 1){ #if multiple values of lambda have the same accuracy, pick the one that uses the fewest variables
+  lambda.opt.NVar <- lambdamods.df$NVarAve[which(lambdamods.df$Lambda %in% lambda.opt)]
+  lambda.opt <- lambdamods.df$Lambda[which(lambdamods.df$AccAve == max(lambdamods.df$AccAve) & lambdamods.df$NVarAve == min(lambda.opt.NVar) )]
+}
+
+  return(list("LambdasAll"=lambdamods.df,"lambda.min"=lambda.opt,"modelsinfo"=modelinfo,"avgCoeff"=AvgCoeffs, "AllCoeff"=allcoefs,"avgScaledCoeff"=AvgCoeffs.scaled,"AllScaledCoeff"=allcoefs.scaled,"GLMNetImp"=varimp,"GLMNetImp.scaled"=varimp.scaled,"GLMNetmodels"=models))
+}
+
+##Use manually picked alpha of 0.4:
+glmnet.alpha0p4.lambdaopt <- glmnet.lambdaopt(train_data_scaled[,-which(colnames(train_data_scaled)=="LPS.Added")],train_data_scaled$LPS.Added,foldsreps = foldsreps1.df,repeats=50,folds=5,alpha.set=0.4)
+
+glmnet.alpha0p4.lambdamin <- glmnet.alpha0p4.lambdaopt$lambda.min
+glmnet.alpha0p4.AvgScaledCoef <- glmnet.alpha0p4.lambdaopt$avgScaledCoeff
+glmnet.alpha0p4.OptSummary <- glmnet.alpha0p4.lambdaopt$LambdasAll
+
+ggplot(glmnet.alpha0p4.OptSummary,aes(`Lambda`,`AccAve`))+geom_point()+theme_bw()+ylim(0.99,1.0)
+ggplot(glmnet.alpha0p4.OptSummary,aes(`NVarAve`,`AccAve`),ylim(0.99,1.0))+geom_point()+theme_bw()
+
+saveRDS(glmnet.alpha0p4.lambdaopt,"GLMNET_alpha0p4.rds")
+
+##Use caret-selected alpha of 0.1:
+glmnet.alpha0p1.lambdaopt <- glmnet.lambdaopt(train_data_scaled[,-which(colnames(train_data_scaled)=="LPS.Added")],train_data_scaled$LPS.Added,foldsreps = foldsreps1.df,repeats=50,folds=5,alpha.set=0.1)
+
+glmnet.alpha0p1.lambdamin <- glmnet.alpha0p1.lambdaopt$lambda.min
+glmnet.alpha0p1.AvgScaledCoef <- glmnet.alpha0p1.lambdaopt$avgScaledCoeff
+glmnet.alpha0p1.OptSummary <- glmnet.alpha0p1.lambdaopt$LambdasAll
+
+plot(glmnet.alpha0p1.OptSummary$Lambda,glmnet.alpha0p1.OptSummary$AccAve)
+plot(glmnet.alpha0p1.OptSummary$NVarAve,glmnet.alpha0p1.OptSummary$AccAve)
+
+saveRDS(glmnet.alpha0p1.lambdaopt,"GLMNET_alpha0p1.rds")
+write_csv(glmnet.alpha0p1.OptSummary,"GLMNET_alpha0p1_OptimizationSummary.csv")
+
+##Test shooting the gap at alpha = 0.25:
+glmnet.alpha0p25.lambdaopt <- glmnet.lambdaopt(train_data_scaled[,-which(colnames(train_data_scaled)=="LPS.Added")],train_data_scaled$LPS.Added,foldsreps = foldsreps1.df,repeats=50,folds=5,alpha.set=0.25)
+
+glmnet.alpha0p25.lambdamin <- glmnet.alpha0p25.lambdaopt$lambda.min
+glmnet.alpha0p25.AvgScaledCoef <- glmnet.alpha0p25.lambdaopt$avgScaledCoeff
+glmnet.alpha0p25.OptSummary <- glmnet.alpha0p25.lambdaopt$LambdasAll
+
+plot(glmnet.alpha0p25.OptSummary$Lambda,glmnet.alpha0p25.OptSummary$AccAve)
+plot(glmnet.alpha0p25.OptSummary$NVarAve,glmnet.alpha0p25.OptSummary$AccAve)
+
+saveRDS(glmnet.alpha0p1.lambdaopt,"GLMNET_alpha0p1.rds")
+glmnet.alpha0p1.lambdaopt <- readRDS("glmnet.alpha0p1.lambdaopt")
+
+#Plot together for comparison
+ggplot(glmnet.alpha0p4.OptSummary,aes(`Lambda`,`AccAve`))+geom_point()+theme_bw()+geom_point(aes(glmnet.alpha0p1.OptSummary$Lambda,glmnet.alpha0p1.OptSummary$AccAve),color = "blue")+geom_point(aes(glmnet.alpha0p25.OptSummary$Lambda,glmnet.alpha0p25.OptSummary$AccAve),color = "green")+ylim(0.99,1.0)
+
+ggplot(glmnet.alpha0p4.OptSummary,aes(`NVarAve`,`AccAve`))+geom_point()+theme_bw()+geom_point(aes(glmnet.alpha0p1.OptSummary$NVarAve,glmnet.alpha0p1.OptSummary$AccAve),color = "blue")+geom_point(aes(glmnet.alpha0p25.OptSummary$NVarAve,glmnet.alpha0p25.OptSummary$AccAve),color = "green")+ylim(0.99,1.0)
+
+
+### Average coefficients over the folds/reptitions models with selected alpha and lambda values: ####
+allcoef.alpha0p1 <- glmnet.alpha0p1.lambdaopt$AllCoeff
+coeff.alpha0p1.lambda0p44 <- data.frame(cbind("var"=allcoef.alpha0p1$var,allcoef.alpha0p1[,grep("Lambda0.44",colnames(allcoef.alpha0p1))]))
+rownames(coeff.alpha0p1.lambda0p44)<-coeff.alpha0p1.lambda0p44$var
+
+## Average raw coefficient value
+AvgCoeff_a0.1_l0.44 <- data.frame(cbind(coeff.alpha0p1.lambda0p44$var,
+                             "AvgCoeff" = rowSums(coeff.alpha0p1.lambda0p44[,-which(colnames(coeff.alpha0p1.lambda0p44) == "var")])/(ncol(coeff.alpha0p1.lambda0p44)-1),
+                             "CoeffSD" = apply(coeff.alpha0p1.lambda0p44[,-which(colnames(coeff.alpha0p1.lambda0p44) == "var")],1,sd)))
+AvgCoeff_a0.1_l0.44$AvgCoeff <- as.numeric(AvgCoeff_a0.1_l0.44$AvgCoeff)
+
+AvgCoeff_a0.1_l0.44$CoeffSD <- as.numeric(AvgCoeff_a0.1_l0.44$CoeffSD)
+AvgCoeff_a0.1_l0.44 <- AvgCoeff_a0.1_l0.44[order(abs(AvgCoeff_a0.1_l0.44$AvgCoeff),decreasing = TRUE),]
+
+write.csv(AvgCoeff_a0.1_l0.44,"GLMNet_AvgCoeffs_ap1_lp44.csv")
+write.csv(coeff.alpha0p1.lambda0p44,"GLMNet_Coeffs_ap1_lp44.csv")
+
+## Average scaled coefficient value
+norm_to_max <-function(x){
+  normx <- x/max(abs(x))
+  return(normx)
+}
+coeff.alpha0p1.lambda0p44.scaled <- as.data.frame(cbind("var"=coeff.alpha0p1.lambda0p44$var,apply(coeff.alpha0p1.lambda0p44[,-which(colnames(coeff.alpha0p1.lambda0p44)=="var")],2,norm_to_max)))
+coeff.alpha0p1.lambda0p44.scaled[,-which(colnames(coeff.alpha0p1.lambda0p44)=="var")] <- apply(coeff.alpha0p1.lambda0p44.scaled[,-which(colnames(coeff.alpha0p1.lambda0p44.scaled)=="var")],2,as.numeric)
+
+AvgCoeff_a0.1_l0.44.scaled <- data.frame(cbind(coeff.alpha0p1.lambda0p44.scaled$var,
+                             "AvgCoeff" = rowSums(coeff.alpha0p1.lambda0p44.scaled[,-which(colnames(coeff.alpha0p1.lambda0p44.scaled) == "var")])/(ncol(coeff.alpha0p1.lambda0p44.scaled)-1),
+                             "CoeffSD" = apply(coeff.alpha0p1.lambda0p44.scaled[,-which(colnames(coeff.alpha0p1.lambda0p44.scaled) == "var")],1,sd)))
+
+AvgCoeff_a0.1_l0.44.scaled$AvgCoeff <- as.numeric(AvgCoeff_a0.1_l0.44.scaled$AvgCoeff)
+AvgCoeff_a0.1_l0.44.scaled$CoeffSD <- as.numeric(AvgCoeff_a0.1_l0.44.scaled$CoeffSD)
+
+AvgCoeff_a0.1_l0.44.scaled <- AvgCoeff_a0.1_l0.44.scaled[order(abs(AvgCoeff_a0.1_l0.44.scaled$AvgCoeff),decreasing = TRUE),]
+
+write.csv(AvgCoeff_a0.1_l0.44.scaled,"GLMNet_AvgScaledCoeffs_ap1_lp44.csv")
+write.csv(coeff.alpha0p1.lambda0p44.scaled,"GLMNet_ScaledCoeffs_ap1_lp44.csv")
+
+## Average rank of each variable
+coeff.alpha0p1.lambda0p44.rank <- coeff.alpha0p1.lambda0p44.scaled
+coeff.alpha0p1.lambda0p44.rank[coeff.alpha0p1.lambda0p44.rank == 0] <- NA #make 0s NA so they don't mess with the ranking
+coeff.alpha0p1.lambda0p44.rank[,-which(colnames(coeff.alpha0p1.lambda0p44.rank)=="var")] <- coeff.alpha0p1.lambda0p44.rank[,-which(colnames(coeff.alpha0p1.lambda0p44.rank)=="var")] %>% apply(.,2,rank,na.last="keep")
+coeff.alpha0p1.lambda0p44.rank[is.na(coeff.alpha0p1.lambda0p44.rank)] <- 85
+
+AvgCoeff_a0.1_l0.44.rank <- data.frame(cbind(coeff.alpha0p1.lambda0p44.rank$var,
+                             "AvgRank" = rowSums(coeff.alpha0p1.lambda0p44.rank[,-which(colnames(coeff.alpha0p1.lambda0p44.rank) == "var")])/(ncol(coeff.alpha0p1.lambda0p44.rank)-1),
+                             "RankSD" = apply(coeff.alpha0p1.lambda0p44.rank[,-which(colnames(coeff.alpha0p1.lambda0p44.rank) == "var")],1,sd)))
+
+AvgCoeff_a0.1_l0.44.rank$AvgRank <- as.numeric(AvgCoeff_a0.1_l0.44.rank$AvgRank)
+AvgCoeff_a0.1_l0.44.rank$RankSD <- as.numeric(AvgCoeff_a0.1_l0.44.rank$RankSD)
+
+AvgCoeff_a0.1_l0.44.rank <- AvgCoeff_a0.1_l0.44.rank[order(abs(AvgCoeff_a0.1_l0.44.rank$AvgRank)),]
+
+write.csv(AvgCoeff_a0.1_l0.44.rank,"GLMNet_AvgCoeffsRank_ap1_lp44.csv")
+write.csv(coeff.alpha0p1.lambda0p44.rank,"GLMNet_CoeffsRanks_ap1_lp44.csv")
+
+#Number of non-zero coefficients at each fold:
+nz.coeff.alpha0p1.lambda0p44 <- data.frame(matrix(nrow = ncol(coeff.alpha0p1.lambda0p44)-1,ncol=4))
+colnames(nz.coeff.alpha0p1.lambda0p44) <- c("ModelIndex","Rep","Fold","NonZeroCoeffs")
+nz.coeff.alpha0p1.lambda0p44$ModelIndex <- seq(1,250,1)
+Reps.Folds <- colnames(coeff.alpha0p1.lambda0p44) %>% gsub("Lambda0.44.","",.)
+for(i in 2:ncol(coeff.alpha0p1.lambda0p44)){
+  nz.coeff.alpha0p1.lambda0p44$Fold[i-1] <- str_sub(Reps.Folds[i],str_length(Reps.Folds[i]))
+  nz.coeff.alpha0p1.lambda0p44$Rep[i-1] <- str_sub(Reps.Folds[i],end=str_length(Reps.Folds[i])-2)
+  nz.coeff.alpha0p1.lambda0p44$NonZeroCoeffs[i-1] <- length(which(coeff.alpha0p1.lambda0p44[,i] != 0))
+  }
+write.csv(nz.coeff.alpha0p1.lambda0p44,"GLMNet_NonZeroCoeff_ap1_lp44.csv")
+
+#### Generate a final model from the entire training set using the lambda value picked earlier: ####
+###alpha = 0.4
+glmnet.finalmodel.ap4.lp18 <- glmnet(train_data_scaled[,-which(colnames(train_data_scaled)=="LPS.Added")],train_data_scaled$LPS.Added,family="binomial",alpha=0.4)
+glmnet.finalmodel.ap4.lp18$lambdaopt <- glmnet.alpha0p4.lambdaopt$lambda.min
+
+  checktraining <- predict(glmnet.finalmodel.ap4.lp18,newx=as.matrix(train_data_scaled[,-which(colnames(train_data_scaled)=="LPS.Added")]),s = glmnet.finalmodel.ap4.lp18$lambdaopt,type="class")
+  trainingCM.ap4.lp18 <- confusionMatrix(as.factor((checktraining)),as.factor(train_data_scaled$LPS.Added))
+  
+    checktesting <- predict(glmnet.finalmodel.ap4.lp18,newx=as.matrix(test_data_scaled[,-which(colnames(test_data_scaled)=="LPS.Added")]),s = glmnet.finalmodel.ap4.lp18$lambdaopt,type="class")
+  testingCM.ap4.lp18 <- confusionMatrix(as.factor((checktesting)),as.factor(test_data_scaled$LPS.Added))
+  
+  checkMJLPS <- predict(glmnet.finalmodel.ap4.lp18,newx=as.matrix(MJ.LPS_data_scaled[,-which(colnames(MJ.LPS_data_scaled)=="LPS.Added")]),s = glmnet.finalmodel.ap4.lp18$lambdaopt,type="class")
+  MJLPS.CM.ap4.lp18 <- confusionMatrix(as.factor((checkMJLPS)),as.factor(MJ.LPS_data_scaled$LPS.Added))
+  
+  coefs.glmnet.finalmodel.ap4.lp18 <- as.data.frame(as.matrix(coef(glmnet.finalmodel.ap4.lp18,s=glmnet.finalmodel.ap4.lp18$lambdaopt)))
+  coefs.glmnet.finalmodel.ap4.lp18$var <- rownames(coefs.glmnet.finalmodel.ap4.lp18)
+  coefsorder.glmnet.finalmodel.ap4.lp18 <- coefs.glmnet.finalmodel.ap4.lp18[order(abs(coefs.glmnet.finalmodel.ap4.lp18$s1),decreasing = TRUE),]
+  
+  
+saveRDS(glmnet.finalmodel.ap4.lp18,"GLMNET_FinalModel_ap4_lp18.rds")
+
+###alpha=0.1
+glmnet.finalmodel.ap1.lp44 <- glmnet(train_data_scaled[,-which(colnames(train_data_scaled)=="LPS.Added")],train_data_scaled$LPS.Added,family="binomial",alpha=0.1)
+glmnet.finalmodel.ap1.lp44$lambdaopt <- glmnet.alpha0p1.lambdaopt$lambda.min
+
+  checktraining <- predict(glmnet.finalmodel.ap1.lp44,newx=as.matrix(train_data_scaled[,-which(colnames(train_data_scaled)=="LPS.Added")]),s = glmnet.finalmodel.ap1.lp44$lambdaopt,type="class")
+  trainingCM.ap1.lp44 <- confusionMatrix(as.factor(checktraining),as.factor(train_data_scaled$LPS.Added))
+  
+    checktraining2 <- predict(glmnet.finalmodel.ap1.lp44,newx=as.matrix(train_data_scaled[,-which(colnames(train_data_scaled)=="LPS.Added")]),s = glmnet.finalmodel.ap1.lp44$lambdaopt,type="class")
+  trainingCM.ap1.lp44 <- confusionMatrix(as.factor((checktraining2)),as.factor(train_data_scaled$LPS.Added))
+  
+    checktesting <- predict(glmnet.finalmodel.ap1.lp44,newx=as.matrix(test_data_scaled[,-which(colnames(test_data_scaled)=="LPS.Added")]),s = glmnet.finalmodel.ap1.lp44$lambdaopt,type="class")
+  testingCM.ap1.lp44 <- confusionMatrix(as.factor((checktesting)),as.factor(test_data_scaled$LPS.Added))
+  
+    checkMJLPS <- predict(glmnet.finalmodel.ap1.lp44,newx=as.matrix(MJ.LPS_data_scaled[,-which(colnames(MJ.LPS_data_scaled)=="LPS.Added")]),s = glmnet.finalmodel.ap1.lp44$lambdaopt,type="class")
+  MJLPS.CM.ap1.lp44 <- confusionMatrix(as.factor((checkMJLPS)),as.factor(MJ.LPS_data_scaled$LPS.Added))
+  
+  #Use coefficient values to show importance:
+  coefs.glmnet.finalmodel.ap1.lp44 <- as.data.frame(as.matrix(coef(glmnet.finalmodel.ap1.lp44,s=glmnet.finalmodel.ap1.lp44$lambdaopt)))
+  coefs.glmnet.finalmodel.ap1.lp44$var <- rownames(coefs.glmnet.finalmodel.ap1.lp44)
+  coefsorder.glmnet.finalmodel.ap1.lp44 <- coefs.glmnet.finalmodel.ap1.lp44[order(abs(coefs.glmnet.finalmodel.ap1.lp44$s1),decreasing = TRUE),]
+  
+  #Check against the caret package "varImp:"
+  glmnet.ap1.lp44.caretImp <- varImp(glmnet.finalmodel.ap1.lp44,lambda = 0.44)
+  glmnet.ap1.lp44.caretImp$var <- rownames(glmnet.ap1.lp44.caretImp)
+  glmnet.ap1.lp44.caretImp <- glmnet.ap1.lp44.caretImp[order(glmnet.ap1.lp44.caretImp$Overall,decreasing = TRUE),]
+  
+  #saving things
+  saveRDS(glmnet.finalmodel.ap1.lp44,"GLMNET_FinalModel_ap1_lp44.rds")
+  write_csv(coefsorder.glmnet.finalmodel.ap1.lp44,"GLMNET_FinalModel_CoefOrder.csv")
+  write_csv(glmnet.ap1.lp44.caretImp,"GLMNET_FinalModel_CaretImp.csv")
+  
+  ###alpha=0.25
+glmnet.finalmodel.ap25.lp28 <- glmnet(train_data_scaled[,-which(colnames(train_data_scaled)=="LPS.Added")],train_data_scaled$LPS.Added,family="binomial",alpha=0.25)
+glmnet.finalmodel.ap25.lp28$lambdaopt <- glmnet.alpha0p25.lambdaopt$lambda.min
+
+  checktraining <- predict(glmnet.finalmodel.ap25.lp28,newx=as.matrix(train_data_scaled[,-which(colnames(train_data_scaled)=="LPS.Added")]),s = glmnet.finalmodel.ap25.lp28$lambdaopt,type="response")
+  trainingCM.ap25.lp28 <- confusionMatrix(as.factor(round(checktraining,0)),as.factor(train_data_scaled$LPS.Added))
+  
+    checktesting <- predict(glmnet.finalmodel.ap25.lp28,newx=as.matrix(test_data_scaled[,-which(colnames(test_data_scaled)=="LPS.Added")]),s = glmnet.finalmodel.ap25.lp28$lambdaopt,type="response")
+  testingCM.ap25.lp28 <- confusionMatrix(as.factor(round(checktesting,0)),as.factor(test_data_scaled$LPS.Added))
+  
+    checkMJLPS <- predict(glmnet.finalmodel.ap25.lp28,newx=as.matrix(MJ.LPS_data_scaled[,-which(colnames(MJ.LPS_data_scaled)=="LPS.Added")]),s = glmnet.finalmodel.ap25.lp28$lambdaopt,type="class")
+  MJLPS.CM.ap25.lp28 <- confusionMatrix(as.factor((checkMJLPS)),as.factor(MJ.LPS_data_scaled$LPS.Added))
+  
+  coefs.glmnet.finalmodel.ap25.lp28 <- as.data.frame(as.matrix(coef(glmnet.finalmodel.ap25.lp28,s=glmnet.finalmodel.ap25.lp28$lambdaopt)))
+  coefs.glmnet.finalmodel.ap25.lp28$var <- rownames(coefs.glmnet.finalmodel.ap25.lp28)
+  coefsorder.glmnet.finalmodel.ap25.lp28 <- coefs.glmnet.finalmodel.ap25.lp28[order(abs(coefs.glmnet.finalmodel.ap25.lp28$s1),decreasing = TRUE),]
+  
+  saveRDS(glmnet.finalmodel.ap25.lp28,"GLMNET_FinalModel_ap25_lp28.rds")
+
+# glmnetimportance <- as.data.frame(rfeglmnet_results1[["avgScaledCoeff"]])
+# glmnetAveAcc <- as.data.frame(rfeglmnet_results1[["AveAcc"]])
+# glmnetAllAcc <-  as.data.frame(rfeglmnet_results1[["AllAcc"]])
+# glmnetAllScaledCoeff <- rfeglmnet_results1[["AllScaledCoeff"]]
+
+# #split up into sublists
+# rfeglmnet_results1.1 <- rfeglmnet(train_data_scaled[,-which(colnames(train_data_scaled)=="LPS.Added")],train_data_scaled$LPS.Added,foldsreps = foldsrep1.df.1,repeats=10,folds=5)
+# rfeglmnet_results1.1[["avgScaledCoeff"]] 
+# 
+# rfeglmnet_results1.2 <- rfeglmnet(train_data_scaled[,-which(colnames(train_data_scaled)=="LPS.Added")],train_data_scaled$LPS.Added,foldsreps = foldsrep1.df.2,repeats=10,folds=5)
+# rfeglmnet_results1.2[["avgScaledCoeff"]] 
+# 
+# rfeglmnet_results1.3 <- rfeglmnet(train_data_scaled[,-which(colnames(train_data_scaled)=="LPS.Added")],train_data_scaled$LPS.Added,foldsreps = foldsrep1.df.3,repeats=10,folds=5)
+# rfeglmnet_results1.3[["avgScaledCoeff"]]
+
+
+###Try a Ridge Regression just to see what it does with the variables:####
+model.ridge <- glmnet(as.matrix(train_data_scaled[,-which(colnames(train_data_scaled)=="LPS.Added")]),as.vector(train_data_scaled$LPS.Added),family="binomial",alpha = 0)
+coef.ridge <- as.data.frame(as.matrix(coef(model.ridge, s=0.2))[-1,]) #doesn't seem to matter what we put as "s" when it is a ridge optimization
+colnames(coef.ridge) <- "coefs"
+coef.ridge$vars <- rownames(coef.ridge)
+coef.ridge.nz <-  coef.ridge[which(coef.ridge$coefs !=0),]
+coef.ridge.nz.ordered <- as.data.frame(coef.ridge.nz[order(abs(coef.ridge.nz$coefs),decreasing = TRUE),])
+
+confusionMatrix(as.factor(round(predict(model.ridge,as.matrix(test_data_scaled[,-which(colnames(test_data_scaled)=="LPS.Added")]),s=0.2,type="response"),0)),as.factor(test_data_scaled$LPS.Added))
+
+saveRDS(coef.ridge.nz.ordered,"GLMNET_RidgeRegression_Importance.rds")
+
+### Custom glmnet function using ridge regression (alpha = 0) so that it keeps all provided predictors: ####
+rfeglmnet <- function(x,y, testx=NULL,testy=NULL,repeats = 50, folds = 5,sizes = c(ncol(x):2),foldsreps = foldsreps1.df,lambda.set=0.3){
+  sizes <- sizes[order(sizes, decreasing = TRUE)]
+  modelinfo <- NULL
+  #The function only works if the first size is the full size. Checking that 84 is one of the selected sizes
+  check84 <- which(sizes == 84)
+  if(length(check84)==0){
+    sizes <- c(84,sizes)#Add a "full size" model if not inputted
+  }
+  
+  varimp <- vector(mode='list', length=repeats)
+  models <- vector(mode='list', length=repeats)
+  
+    #structuring input data (because some of the algorithms take x and y as part of a dataframe, others as two separate arguments)
+  data <- x
+  data$y <- y
+  
+   #If testing data is given, structuring test data (because some of the algorithms take x and y as part of a dataframe, others as two separate arguments)
+  if(!is.null(testx) || !is.null(testy)){
+    testing <- testx
+    testing$y <- testy
+  }
+  
+  FoldAccuracies <- data.frame(matrix(ncol=length(sizes),nrow=repeats*folds))
+  colnames(FoldAccuracies) <- sizes
+  allcoefs<- data.frame("var"=colnames(x))
+  for(k in 1:repeats){
+    varimp[[k]] <- vector(mode='list', length=folds)
+    models[[k]] <- vector(mode='list', length=folds)
+    kcoefs <- data.frame("var"=colnames(x))
+    for(j in 1:folds){
+        varimp[[k]][[j]] <- vector(mode='list', length=length(sizes))
+        models[[k]][[j]] <- vector(mode='list', length=length(sizes))
+        #itrain_index <- createDataPartition(data$y,p=.9,list=F) 
+        jfoldindex <- foldsreps[,(k-1)*5 + j] #Folds/Reps are ordered by Reps and then by folds.
+        jtrain_data <- data[jfoldindex,]
+        jtest_data <- data[-jfoldindex,]
+        predictors <- colnames(x)
+        
+      newentry <- data.frame(matrix(ncol=3,nrow=length(sizes)))
+      colnames(newentry) <- c("Variables","Accuracy","NonZeroCoeffs")
+      jcoefs <- data.frame("var"=colnames(x))
+      
+      for(i in 1:length(sizes)){
+      size <- sizes[i]
+      newentry$Variables[i] <- size
+        
+        #Generate a new model at the new size
+        ipredictors <- jtrain_data[,c(which(colnames(jtrain_data) %in% predictors[1:size]))]
+        imodel <- glmnet(x = as.matrix(ipredictors),y =as.vector(jtrain_data$y),family = "binomial",alpha = 0) #Ridge regression keeps all the coefficients provided
+        
+        #If no test set is given, check on the unused fraction of the training set:
+      if(is.null(testx) | is.null(testy)){
+        itestpredictors <- jtest_data[,which(colnames(jtest_data) %in% predictors[1:size])]
+        check <- confusionMatrix(as.factor(round(predict(imodel,newx=as.matrix(itestpredictors),type="response",s=lambda.set),0)),as.factor(jtest_data$y))
+      }else{
+        #Check new model on provided test set
+        itestpredictors <- testing[,which(colnames(testing) %in% predictors[1:size])]
+        check <- confusionMatrix(as.factor(round(predict(imodel,newx=as.matrix(itestpredictors),type="response",s=lambda.set),0)),as.factor(testing$y))
+      }
+      
+      newentry$Accuracy[i] <- check$overall["Accuracy"]
+      
+      coefs <- as.data.frame(as.matrix((coef(imodel,s=lambda.set))))
+      coefs2 <- coefs[rownames(coefs) != "(Intercept)",]
+      names(coefs2) <- rownames(coefs)[rownames(coefs)!= "(Intercept)"]
+      coefs2[is.na(coefs2)] <- 0
+      vimp <- data.frame( unname(coefs2), var = names(coefs2))
+      colnames(vimp)[1]<-paste0("Vars",size,".",k,".",j)
+      rownames(vimp) <- names(coefs2)
+      vimp <- vimp[order(abs(vimp[,1]), decreasing = TRUE), , drop = FALSE]
+      vimpscaled <- vimp
+      vimpscaled[,1] <- as.numeric(abs(vimpscaled[,1])/max(abs(vimpscaled[,1])))
+      iscaled0s <- which(vimpscaled[,1] == 0)
+      if(length(iscaled0s) > 1)      reorder0 <- sample(iscaled0s) else reorder0 <- iscaled0s
+      vimpscaled.reordered <- vimpscaled[c(which(vimpscaled[,1] != 0),reorder0),]
+      #vimp
+      
+      #Save variable importance and model structure for each model
+      varimp[[k]][[j]][[i]] <- vimp
+      models[[k]][[j]][[i]] <- imodel
+       
+      FoldAccuracies[(k-1)*folds+j,i] <- check$overall["Accuracy"]
+      
+      newentry$NonZeroCoeffs[i] <- length(which(vimp[,1] != 0))
+      
+      joined <- left_join(jcoefs,vimpscaled.reordered,by="var")
+      jcoefs <- joined
+      coeforder <- vimp
+      predictors <- vimpscaled.reordered$var
+      }
+      newkcoefs <- left_join(kcoefs,jcoefs,by="var")
+      kcoefs <- newkcoefs
+      
+      modelinfo <- rbind(modelinfo,newentry)
+    }
+    newallcoefs <- left_join(allcoefs,kcoefs,by="var")
+    allcoefs <- newallcoefs
+  }
+AvgAcc <- MeanSD(FoldAccuracies)
+aveacc2 <- data.frame("Ave" = AvgAcc[1:(length(AvgAcc)/2)],"SD" =AvgAcc[(length(AvgAcc)/2 + 1):length(AvgAcc)] )
+
+newallcoefs[is.na(newallcoefs)] = 0
+rownames(newallcoefs)<- newallcoefs[,1]
+avgCoeff <- data.frame("name" = newallcoefs[,1],"ave"=rowSums(newallcoefs[,-1])/(ncol(newallcoefs)-1),"sd" = apply(newallcoefs[,-1],1,sd))
+avgCoeff.ordered <- avgCoeff[order(avgCoeff$ave,decreasing = TRUE),]
+
+  sizemods.df <- data.frame(matrix(nrow=length(sizes),ncol=3))
+  colnames(sizemods.df) <- c("Size","AccAve","AccSD")
+  for(i in 1:length(sizes)){
+    isizeinfo <- modelinfo[which(modelinfo$Variables == sizes[i]),]
+    AvgInfo <- MeanSD(isizeinfo)
+    aveinfo2 <- data.frame("Ave" = AvgInfo[1:(length(AvgInfo)/2)],"SD" =AvgInfo[(length(AvgInfo)/2 + 1):length(AvgInfo)])
+    sizemods.df$Size[i] <- sizes[i]
+    sizemods.df$AccAve[i] <- aveinfo2$Ave[which(rownames(aveinfo2)=="Accuracy")]
+    sizemods.df$AccSD[i] <- aveinfo2$SD[which(rownames(aveinfo2)=="Accuracy")]
+  }
+  
+  return(list("modelinfo"=modelinfo,"AveAcc"=aveacc2,"avgScaledCoeff"=avgCoeff.ordered,"AllAcc"=FoldAccuracies, "AllScaledCoeff"=newallcoefs,"varimp"=varimp,"models"=models,"SizeResults.df"=sizemods.df))
+}
+
+rfeglmnet_results1 <- rfeglmnet(train_data_scaled[,-which(colnames(train_data_scaled)=="LPS.Added")],train_data_scaled$LPS.Added,foldsreps = foldsreps1.df,repeats=50,folds=5,lambda.set = 0.01) #very slight changes to importance order if lambda.set is 0.01 instead of 0.3
+rfeglmnet_results1[["avgScaledCoeff"]] 
+glmnetrfe_summary<-rfeglmnet_results1[["modelinfo"]]
+glmnetrfe_size_vs_accuracy <- as.data.frame(rfeglmnet_results1[["SizeResults.df"]])
+
+ggplot(glmnetrfe_size_vs_accuracy,aes(`Size`,`AccAve`))+geom_point()+theme_bw()
+
+#saveRDS(rfeglmnet_results1,"GLMNET_RidgeRegRFE.rds")
+
+rfeglmnet_results2 <- rfeglmnet(train_data_scaled[,-which(colnames(train_data_scaled)=="LPS.Added")],train_data_scaled$LPS.Added,foldsreps = foldsreps1.df,repeats=50,folds=5,lambda.set = 0.44) #very slight changes to importance order if lambda.set is 0.01 instead of 0.3
+rfeglmnet_results2[["avgScaledCoeff"]] 
+glmnetrfe_summary2<-rfeglmnet_results2[["modelinfo"]]
+glmnetrfe_size_vs_accuracy2 <- as.data.frame(rfeglmnet_results2[["SizeResults.df"]])
+
+ggplot(glmnetrfe_size_vs_accuracy2,aes(`Size`,`AccAve`))+geom_point()+theme_bw()
+write_csv(glmnetrfe_size_vs_accuracy2,"GLMNet_RidgeRegRFE_l0p44.csv")
+
+#                name         ave         sd
+# CCL5           CCL5 0.980666798 0.06731634
+# CXCL2         CXCL2 0.825035837 0.11580637
+# LTB             LTB 0.806412425 0.13808492
+# IL6             IL6 0.601491429 0.17270337
+# CXCL1         CXCL1 0.587931892 0.12450228
+# CCL20         CCL20 0.536497051 0.18584535
+# CCL21         CCL21 0.487672893 0.20187060
+# CCL2           CCL2 0.482129419 0.17247521
+# CXCL8         CXCL8 0.475117692 0.21509475
+# CSF3           CSF3 0.401507013 0.18146639
+# BMP4           BMP4 0.396623148 0.15869547
+# CCL17         CCL17 0.393866730 0.19760995
+# CXCL5         CXCL5 0.385450630 0.16741352
+# IL1B           IL1B 0.381721429 0.14798688
+# TNFSF13B   TNFSF13B 0.341167364 0.19159132
+# NODAL         NODAL 0.287422772 0.17888397
+# IL15           IL15 0.278472673 0.14973992
+# C5               C5 0.267318798 0.15842861
+# TNF             TNF 0.210267323 0.16391023
+# BMP7           BMP7 0.198801880 0.13799729
+# CNTF           CNTF 0.198474886 0.12267220
+# TNFSF11     TNFSF11 0.180638833 0.13925954
+# VEGFA         VEGFA 0.171485147 0.10504532
+# LTA             LTA 0.157349630 0.11308440
+# MIF             MIF 0.155825624 0.11502461
+# ADIPOQ       ADIPOQ 0.140082749 0.13961412
+# IL18           IL18 0.135645046 0.09616216
+# SPP1           SPP1 0.135610089 0.10906693
+# TNFRSF11B TNFRSF11B 0.132349442 0.13626678
+# CXCL16       CXCL16 0.127412280 0.11241598
+# TNFSF10     TNFSF10 0.121040452 0.10493180
+# CXCL11       CXCL11 0.119675208 0.11596482
+# CXCL9         CXCL9 0.110735370 0.09861429
+# IL22           IL22 0.106990843 0.09119963
+# CXCL13       CXCL13 0.102737089 0.09607115
+# IL7             IL7 0.100090739 0.09451698
+# CXCL10       CXCL10 0.100010034 0.11147645
+# IL16           IL16 0.097905248 0.08289395
+# XCL1           XCL1 0.091207882 0.10163343
+# CCL22         CCL22 0.087054316 0.08929288
+# IL24           IL24 0.086151951 0.09637506
+# IL9             IL9 0.083138325 0.09399841
+# PPBP           PPBP 0.079759979 0.09567604
+# IL12A         IL12A 0.069526519 0.09173412
+# IL4             IL4 0.065928323 0.09002017
+# IL1RN         IL1RN 0.064919465 0.07068560
+# IL12B         IL12B 0.056865298 0.10000462
+# CCL19         CCL19 0.056533381 0.08115927
+# IL11           IL11 0.056207361 0.06995900
+# CSF1           CSF1 0.055581235 0.07877257
+# THPO           THPO 0.054990362 0.07902933
+# GPI             GPI 0.052735840 0.07031547
+# IL21           IL21 0.050765549 0.06596560
+# CX3CL1       CX3CL1 0.048906417 0.06006283
+# IFNA2         IFNA2 0.047106585 0.07134413
+# CXCL12       CXCL12 0.041135762 0.07477614
+# TGFB2         TGFB2 0.040759205 0.05913769
+# IFNG           IFNG 0.035536729 0.05067322
+# MSTN           MSTN 0.035102765 0.07027167
+# IL3             IL3 0.034118412 0.05040967
+# CCL24         CCL24 0.031464194 0.06085994
+# CCL3           CCL3 0.030268565 0.04887838
+# CCL1           CCL1 0.027923201 0.04664003
+# IL13           IL13 0.025744120 0.04432153
+# CCL7           CCL7 0.025189055 0.05347134
+# CCL13         CCL13 0.023041455 0.04205392
+# IL27           IL27 0.021928750 0.04012295
+# IL17A         IL17A 0.020479247 0.03995100
+# IL23A         IL23A 0.019535577 0.04492781
+# BMP6           BMP6 0.018795195 0.03999925
+# IL1A           IL1A 0.018592467 0.04268904
+# OSM             OSM 0.018582223 0.04183039
+# BMP2           BMP2 0.015437089 0.03882935
+# CD40LG       CD40LG 0.013257703 0.02988507
+# CSF2           CSF2 0.013103100 0.03195263
+# IL5             IL5 0.012464529 0.03185979
+# FASLG         FASLG 0.012025556 0.02906201
+# LIF             LIF 0.011868343 0.02832661
+# IL17F         IL17F 0.010503397 0.03553444
+# CCL11         CCL11 0.008055442 0.02341362
+# IL10           IL10 0.008022650 0.02364066
+# CCL18         CCL18 0.007820709 0.02228306
+# IL2             IL2 0.006136775 0.01928785
+# CCL8           CCL8 0.004054732 0.01398808
+
+
+
+```
+##Tune SVM
+```{r SVM basic tune}
+#svmgrid=expand.grid(C = c(5,1,5e-1,1e-1,5e-2,1e-2,5e-3,1e-3,5e-4,1e-4,5e-5,1e-5))
+svmgrid=expand.grid(C=sort(c(2:10 %o% 10^(1:-5),0.00001),decreasing = TRUE))
+#Unscaled data:####
+svm.pre.unscaled.mod <- train(as.factor(LPS.Added)~.,data=train_data,method = "svmLinear",
+                    trControl = trainControl(index = foldsreps1),tuneGrid=svmgrid)
+svm.pre.unscaled.mod$bestTune
+#        C
+# 27 0.009
+
+      SVM_UNscaled_foldsreps_plot <-ggplot(data = svm.pre.unscaled.mod$results,mapping=aes(x=C,y=Accuracy))+
+        geom_line()+
+        scale_x_log10(breaks=c(100,10,1,1e-1,1e-2,1e-3,1e-4,1e-5))+
+        #xlim(Alpha.factors.ordered)+
+        ylab("SVM Accuracy")+xlab("SVM `cost` values")+
+        theme_classic()+
+        theme(axis.title.y=element_text(size=14,face="bold"))+
+        theme(axis.title.x=element_text(size=14,face="bold"))+
+      theme(axis.text.x = element_text(size = 10,angle = 45,vjust = 0.5))+
+        theme(axis.text.y = element_text(size = 10))
+        #+scale_x_continuous(breaks=c(1,3,5,7,9,11))
+
+#Scaled data:####
+
+svm.pre.scaled.mod <- train(as.factor(LPS.Added)~.,data=train_data_scaled,method = "svmLinear",
+                    trControl = trainControl(index = foldsreps1),tuneGrid=svmgrid)
+svm.pre.scaled.mod$bestTune 
+#        C
+# 27 0.009
+
+      SVM_scaled_foldsreps_plot <-ggplot(data = svm.pre.scaled.mod$results,mapping=aes(x=C,y=Accuracy))+
+        geom_line()+
+        scale_x_log10(breaks=c(5,1,1e-1,1e-2,1e-3,1e-4,1e-5))+
+        #xlim(Alpha.factors.ordered)+
+        ylab("SVM Accuracy")+xlab("SVM `cost` values")+
+        theme_classic()+
+        theme(axis.title.y=element_text(size=14,face="bold"))+
+        theme(axis.title.x=element_text(size=14,face="bold"))+
+      theme(axis.text.x = element_text(size = 10,angle = 45,vjust = 0.5))+
+        theme(axis.text.y = element_text(size = 10))
+
+```
+##Tune NB
+```{NB basic tune}
+nb_grid=expand.grid(laplace=seq(from=0,to=10,by=0.5),
+                    adjust = 1,
+                    usekernel = c(TRUE,FALSE))
+laplace.factors.ordered <- levels(as.factor(nb_grid$laplace))[levels(as.factor(nb_grid$laplace)) %>% as.numeric %>% order(decreasing=FALSE)]
+
+#Predefined folds/reps with UNSCALED data:####
+nb.pre.mod.UNscaled <- train(x=train_data[,-1],y=as.factor(train_data$LPS.Added),method = "naive_bayes",trControl = trainControl(index = foldsreps1),tuneGrid=nb_grid)
+nb.pre.mod.UNscaled$bestTune
+#   laplace usekernel adjust
+# 2       0      TRUE      1
+saveRDS(nb.pre.mod.UNscaled,"NB_UNSCALED_smallgrid.rds")
+nb.pre.mod.UNscaled <- readRDS("NB_UNSCALED_smallgrid.rds")
+check <- nb.pre.mod.UNscaled$results
+  
+nb.pre.mod.UNscaled3 <- train(x=train_data[,-1],y=as.factor(train_data$LPS.Added),method = "naive_bayes",trControl = trainControl(index = foldsreps1),tuneGrid=nb_grid3)
+nb.pre.mod.UNscaled3$bestTune
+
+nb.pre.mod.UNscaled4 <- train(x=train_data[,-1],y=as.factor(train_data$LPS.Added),method = "naive_bayes",trControl = trainControl(index = foldsreps1),tuneGrid=nb_grid4)
+nb.pre.mod.UNscaled4$bestTune
+saveRDS(nb.pre.mod.UNscaled4,"NB_UNSCALED_smallgrid_adjustop.rds")
+nb.pre.mod.UNscaled4 <- readRDS("NB_UNSCALED_smallgrid_adjustop.rds")
+
+    #plot UNSCALED####
+    NB_UNscaled_foldsreps_plot <-ggplot(data = nb.pre.mod.UNscaled$results,mapping=aes(x=usekernel,y=as.factor(laplace),fill=Accuracy))+
+        geom_tile()+scale_fill_gradientn(colours = c("red","white","blue"),values = rescale(Acc_breaks,to=c(0,1)), limits=c(0.5,1))+
+        ylim(laplace.factors.ordered)+
+        #xlim(Alpha.factors.ordered)+
+        #ggtitle("Validation Set")+#ggtitle("GLMNET Scaled Data - Manual Opt\n Validation Accuracy")+
+        ylab("NB `laplace` smoothing values")+xlab("NB `usekernel`")+
+        theme(axis.text=element_text(size=12),axis.title.y=element_text(size=14,face="bold"))+
+                theme_classic()+
+        theme(axis.title.y=element_text(size=14,face="bold"))+
+        theme(axis.title.x=element_text(size=14,face="bold"))+
+      theme(axis.text.x = element_text(size = 10))+
+        theme(axis.text.y = element_text(size = 10))#+scale_x_continuous(breaks=c(1,3,5,7,9,11))
+
+        ggplot(data = nb.pre.mod.UNscaled4$results, aes(x=as.factor(usekernel),y=factor(adjust)))+geom_tile(aes(fill=Accuracy))+theme_classic2()+
+          xlab("usekernel")+ylab("adjust")+
+  # facet_grid(datatype~.)+
+  scale_fill_viridis(direction=-1,option = "D")
+        
+#Predefined folds/reps with SCALED data:####
+nb.pre.mod.scaled <- train(x=train_data_scaled[,-1],y=as.factor(train_data_scaled$LPS.Added),method = "naive_bayes",trControl = trainControl(index = foldsreps1),tuneGrid=nb_grid)
+nb.pre.mod.scaled$bestTune
+#   laplace usekernel adjust
+# 2       0      TRUE      1
+saveRDS(nb.pre.mod.scaled,"NB_SCALED_smallgrid.rds")
+nb.pre.mod.scaled <- readRDS("NB_SCALED_smallgrid.rds")
+check2 <- nb.pre.mod.scaled$results
+
+nb.pre.mod.scaled4 <- train(x=train_data_scaled[,-1],y=as.factor(train_data_scaled$LPS.Added),method = "naive_bayes",trControl = trainControl(index = foldsreps1),tuneGrid=nb_grid4)
+nb.pre.mod.scaled4$bestTune
+saveRDS(nb.pre.mod.scaled4,"NB_SCALED_smallgrid_adjustop.rds")
+nb.pre.mod.scaled4 <- readRDS("NB_SCALED_smallgrid_adjustop.rds")
+
+    #plot SCALED####
+    NB_scaled_foldsreps_plot <-ggplot(data = nb.pre.mod.scaled$results,mapping=aes(x=usekernel,y=as.factor(laplace),fill=Accuracy))+
+        geom_tile()+scale_fill_gradientn(colours = c("red","white","blue"),values = rescale(Acc_breaks,to=c(0,1)), limits=c(0.5,1))+
+        ylim(laplace.factors.ordered)+
+        #xlim(Alpha.factors.ordered)+
+        #ggtitle("Validation Set")+#ggtitle("GLMNET Scaled Data - Manual Opt\n Validation Accuracy")+
+        ylab("NB `laplace` smoothing values")+xlab("NB `usekernel`")+
+        theme(axis.text=element_text(size=12),axis.title.y=element_text(size=14,face="bold"))+
+                theme_classic()+
+        theme(axis.title.y=element_text(size=14,face="bold"))+
+        theme(axis.title.x=element_text(size=14,face="bold"))+
+      theme(axis.text.x = element_text(size = 10))+
+        theme(axis.text.y = element_text(size = 10))#+scale_x_continuous(breaks=c(1,3,5,7,9,11))
+
+    ggplot(data = nb.pre.mod.scaled4$results[which(nb.pre.mod.scaled4$results$usekernel == "TRUE"),], aes(x=as.factor(adjust),y=factor(laplace)))+geom_tile(aes(fill=Accuracy))+
+  # facet_grid(datatype~.)+
+  scale_fill_viridis(direction=-1,option = "D")
+    
+        ggplot(data = nb.pre.mod.scaled4$results, aes(x=as.factor(usekernel),y=factor(adjust)))+geom_tile(aes(fill=Accuracy))+theme_classic2()+
+          xlab("usekernel")+ylab("adjust")+
+  # facet_grid(datatype~.)+
+  scale_fill_viridis(direction=-1,option = "D")
+    
+
+```
+##Heatmaps of hyperparameters
+```{Heatmaps of hyperparameters}
+
+Scaled_v_Unscaled_fig<-ggarrange(NN_scaled_foldsreps_hm+ rremove("xlab")+ggtitle("NN"),
+                                 RF_scaled_foldsreps_hm+ rremove("xlab")+ggtitle("RF"),
+                                 GLMNet_scaled_foldsreps_hm3+ rremove("xlab")+ggtitle("GLM"),
+                                 NB_scaled_foldsreps_plot+ rremove("xlab")+ggtitle("NB"),
+                                 SVM_scaled_foldsreps_plot+ rremove("xlab")+ggtitle("SVM"),
+                                 NN_unscaled_foldsreps_hm+ggtitle(""),
+                                 RF_unscaled_foldsreps_hm+ggtitle(""),
+                                 GLMNet_unscaled_foldsreps_hm3+ggtitle(""),
+                                 NB_UNscaled_foldsreps_plot+ggtitle(""),
+                                 SVM_UNscaled_foldsreps_plot+ggtitle(""),
+                                     ncol=5,nrow=2,common.legend=TRUE,labels="auto",legend="right")
+
+GLMNET_Scaled_cv.test.val<-annotate_figure(GLMNET_Scaled_cv.test.val,bottom = text_grob("GLM `\u03b1` values", size=14,face="bold",vjust = 0.1),left = text_grob("GLM \u03bb values", size=14,face="bold",rot = 90))
+```
+
+
+# Recursive Feature Selection
+
+After deciding on a train/test split of **XXX/XXX** based on **....** We can set 
+the seed (so our training data and models are the same each time). Then we can 
+run recursive feature selection to optimize hyper parameters and build smaller 
+models.
+
+This will be set up to optimize the following parameters for each model:
+
+-   RF: mtry across a range of (??-??). the number of trees likely does not need
+to be tested since largely 500 trees has been sufficient
+
+-   SVM: cost across a range of (??-??)
+
+-   GLM: lambda same as in the earlier example
+
+-   NB: none!
+
+-   NN: number of hidden layers (1,2,3); and number of nodes in each layer (??); 
+not going to mess with defaults of learning rates.
+
+
+We will perform RFE on the 5 models using 10 repetitions of 10 fold cross 
+validation. 
+
+```{r RFE set up}
+library(doParallel)
+cl <- makeCluster(8)
+registerDoParallel(cl)
+ctrl_cvrep <- rfeControl(method = "repeatedcv",number=2,repeats = 3,allowParallel = TRUE,saveDetails = TRUE)
+sizes <- c(2,4,6,8)
+run_rfe <- function(ctrl,x,y,sizes,varimp="default",...){
+  if(varimp=="default"){
+    result <- rfe(x,y,sizes,rfeControl=ctrl,...)
+  }else{
+    ctrl$functions$rank <- nbFuncs$rank
+    result <- rfe(x,y,sizes,rfeControl=ctrl,...)
+  }
+  return(result)
+}
+glm_ctrl <-ctrl_cvrep
+glm_ctrl$functions <- lrFuncs
+glm_ctrl$functions$rank <- nbFuncs$rank ## applies a filter approach to variable imp
+glm_grid=expand.grid(lambda=c(1e-1,1e-2,1e-3,1e-4,1e-5),
+                     alpha=1)
+rfe_glm <- run_rfe(x=train_data_scaled[,-1],y=as.factor(train_data_scaled$LPS.Added),
+                   sizes = sizes,ctrl=glm_ctrl,
+                   method="glmnet",family="binomial",tuneGrid=glm_grid)
+
+rf_ctrl <- ctrl_cvrep
+rf_ctrl$functions <- rfFuncs
+# rf_ctrl$functions$rank <- nbFuncs$rank ## applies a filter approach to variable imp
+rf_grid=expand.grid(mtry=c(1:25))
+rfe_rf <- run_rfe(x=train_data_scaled[,-1],y=as.factor(train_data_scaled$LPS.Added),
+                   sizes = sizes,ctrl=rf_ctrl,
+                   method="rf",tuneGrid=rf_grid)
+# 
+nb_ctrl <- ctrl_cvrep
+nb_ctrl$functions <- nbFuncs
+nb_grid=expand.grid(laplace=seq(from=0,to=1,by=.1),
+                    usekernel = c(TRUE,FALSE))
+rfe_nb <- run_rfe(x=train_data_scaled[,-1],y=as.factor(train_data_scaled$LPS.Added),
+                   sizes = sizes,ctrl=nb_ctrl,tuneGrid=nb_grid)
+# 
+svm_ctrl <- ctrl_cvrep
+svm_ctrl$functions <- caretFuncs
+svm_ctrl$functions$rank <- nbFuncs$rank ## applies a filter approach to variable imp
+svm_grid <- expand.grid(C=c(5,1,5e-1,1e-1,5e-2,1e-2,5e-3,1e-3,5e-4,1e-4,5e-5,1e-5))
+rfe_svm <- run_rfe(x=train_data_scaled[,-1],y=as.factor(train_data_scaled$LPS.Added),
+                   sizes = sizes,ctrl=svm_ctrl,
+                  method = "svmLinear",
+                  tuneGrid=svm_grid)
+
+nn_ctrl <-ctrl_cvrep
+nn_ctrl$functions <- caretFuncs
+nn_grid <-  expand.grid(size=c(12:13),
+                     decay=c(1e-3,1e-4))
+rfe_nn <- run_rfe(x=train_data_scaled[,-1],y=as.factor(train_data_scaled$LPS.Added),
+                   sizes = sizes,ctrl=nn_ctrl,
+                  method = "nnet",
+                  tuneGrid=nn_grid,trace=FALSE,linout=FALSE)
+
+
+```
+
+```{r RFE Analysis}
+library(ggthemes)
+
+rfe_results <- list(rfe_rf,rfe_glm,rfe_nb,rfe_svm,rfe_nn)
+names(rfe_results) <- c("RF","GLM","NB","SVM","NN")
+
+rfe_df <- data.frame()
+for(i in 1:length(rfe_results)){
+  tmp_df <- rfe_results[[i]]$results %>% 
+    mutate(model=names(rfe_results)[i]) %>% 
+    mutate(isBestSubset=ifelse(Variables==rfe_results[[i]]$bestSubset,TRUE,FALSE)) %>% 
+    mutate(optVars=ifelse(Variables==rfe_results[[i]]$bestSubset,
+                          paste0(rfe_results[[i]]$optVariables,collapse = ","),NA)) 
+  rfe_df <- rfe_df %>% bind_rows(tmp_df)
+}
+rfe_df <- rfe_df %>% 
+         mutate(AccSDHigh=ifelse(Accuracy+AccuracySD>1,1,Accuracy+AccuracySD)) %>% 
+  distinct()
+
+ggplot(rfe_df %>% filter(model!="GLM"),aes(x=Variables,y=Accuracy,color=model,fill=model)) +
+  geom_line(size=.75)+
+  geom_point(data=rfe_df %>% filter(isBestSubset)%>% filter(model!="GLM"),pch=19,size=3,inherit.aes = TRUE)+
+  geom_ribbon(aes(ymax = AccSDHigh, ymin = Accuracy - AccuracySD),linetype=2, alpha = 0.25)+
+  facet_wrap(.~model,nrow=1)+
+  theme_few()+ 
+  scale_fill_few() +
+  scale_color_few()+
+  # scale_x_continuous(breaks = seq(0, 1, by = .2),minor_breaks = seq(0, 1, .1))+
+  theme(text = element_text(size=30),
+        axis.title = element_text(size=20),
+        axis.text = element_text(size=15),
+        panel.grid.major.x = element_line(color = "grey80",linetype = 3),
+        panel.grid.major.y = element_line(color = "grey80",linetype = 3),
+        legend.position = "none",
+        )
+  # coord_cartesian(ylim=c(0,.5),xlim=c(.1,.9))
+
+rfe_df %>% filter(isBestSubset) %>% select(model,Variables,Accuracy,optVars)
+ print(xtable(rfe_df %>% filter(isBestSubset) %>% select(model,Variables,Accuracy,optVars),digits = 6),include.rownames=FALSE)
+
+```
+
+## Variable importance
+
+```{RFE Var Imp}
+gene.list.fill <- LPS.qPCR.norm1.tidy %>% select(Gene.Symbol) %>% 
+                mutate( Gene.Symbol=ifelse(Gene.Symbol=="1L13","IL13",Gene.Symbol))%>% 
+                filter(!(Gene.Symbol%in%c("ACTB","B2M","GAPDH","HPRT1","RPLP0","HGDC","RTC","PPC"))) %>% 
+                distinct()
+
+rfe_var_imp <- data.frame()
+for(i in 1:length(rfe_results)){
+  tmp_df <- rfe_results[[i]]$variables%>%
+    mutate(model=names(rfe_results)[i])%>%
+    select(model,Overall,Resample,var) %>%
+    distinct() %>% 
+    full_join(gene.list.fill ,
+              by=c("var"="Gene.Symbol")) %>%
+    mutate(Overall=ifelse(is.na(Overall),0,Overall)) %>% 
+    mutate(optVars=ifelse(var %in% rfe_results[[i]]$optVariables,TRUE,FALSE)) %>%
+    separate(Resample, into=c("Fold","Rep"),remove = FALSE) %>%
+    group_by(Fold,Rep) %>%
+    
+    arrange(desc(Overall)) %>%
+    mutate(rank=ifelse(Overall==0, 84, row_number())) %>%
+    mutate(rankNA=ifelse(Overall==0, NA, row_number()))%>%
+    mutate(Scaled_imp=(Overall-min(Overall))/(max(Overall)-min(Overall))) %>% 
+    ungroup()
+  rfe_var_imp <- rfe_var_imp %>% bind_rows(tmp_df)
+}
+# TODO: make sure Kristen's code is above this 
+glm_varimp <- read.csv("GLMNet_ScaledCoeffs_ap1_lp44.csv") %>% 
+  select(-X) %>% 
+  pivot_longer(contains("Lambda0.44."),names_to = "Resample",values_to = "Overall",names_prefix = "Lambda0.44.") %>% 
+  group_by(Resample) %>% 
+  arrange(desc(abs(Overall))) %>%
+  mutate(rank=ifelse(Overall==0, 84, row_number())) %>%
+  mutate(rankNA=ifelse(Overall==0, NA, row_number())) %>% 
+  separate(Resample,into=c("Fold","Rep"),remove = FALSE) %>% 
+  mutate(Fold=paste0("Fold",Fold),
+         Rep=paste0("Rep",Rep)) %>% 
+  mutate(absOverall=abs(Overall)) %>% 
+  mutate(Scaled_imp=(absOverall-min(absOverall))/(max(absOverall)-min(absOverall))) %>% 
+  ungroup() %>% 
+  mutate(model="GLM_EN") 
+
+rfe_var_imp <- bind_rows(rfe_var_imp,glm_varimp)%>% 
+  mutate(model=factor(model,levels=c("RF","NN","SVM","NB","GLM","GLM_EN"),
+                      labels=c("Random\n Forest","Neural\n Net","Support\n Vector\n Machine","Naive\n Bayes","GLM","GLM\n Elastic\n Net")))
+
+top_vars <- rfe_var_imp %>%filter(model!="GLM") %>%  group_by(var) %>% 
+  summarise(mean_rank=mean(rank)) %>% 
+  arrange(mean_rank) %>% 
+  mutate(var.rank=row_number()) #%>% 
+  # mutate(var=factor(var,levels=var))
+
+theme.set <- theme_few()+ 
+  # scale_x_continuous(breaks = seq(0, 1, by = .2),minor_breaks = seq(0, 1, .1))+
+  theme(text = element_text(size=30),
+        axis.title = element_text(size=20),
+        axis.text = element_text(size=15),
+        panel.grid.major.x = element_line(color = "grey80",linetype = 3),
+        panel.grid.major.y = element_line(color = "grey80",linetype = 3),
+        legend.position = "none",
+        )
+
+show.top.n <- top_vars$var[1:8]
+rfe_var_imp %>% filter(model!="GLM") %>% 
+  mutate(var=factor(var,levels=top_vars$var))  %>% filter(var%in%top_vars$var[1:10]) %>% 
+  # filter(Overall>0) %>%
+  # filter(optVars) %>%
+  # filter(rank<20) %>%
+  # mutate(Overall=ifelse(model=="GLM",log(Overall),Overall)) %>%
+  ggplot(aes(x=var,y=Scaled_imp))+geom_violin()+
+  facet_wrap(model~.,scales="free")+
+  scale_fill_few() +
+  scale_color_few()+
+  theme.set#
+# 
+rfe_var_imp %>% filter(model!="GLM") %>%
+  mutate(var=factor(var,levels=top_vars$var))  %>% filter(var%in%top_vars$var[1:10]) %>% 
+  filter(model!="GLM") %>%
+  # filter(optVars) %>%
+  # filter(rank<20) %>%
+  # mutate(Overall=ifelse(model=="GLM",log(Overall),Overall)) %>%
+  ggplot(aes(x=model,y=Scaled_imp,color=model,fill=model))+geom_violin(scale="width")+
+  facet_wrap(var~.,nrow=2)+
+  theme_minimal()+
+  theme(text = element_text(size=16))+
+  xlab(NULL)+
+  ylab("Scaled Importance")+
+  scale_fill_few() +
+  scale_color_few()+
+  theme.set
+rfe_var_imp %>% 
+  mutate(var=factor(var,levels=top_vars$var))  %>% filter(var%in%top_vars$var[1:16]) %>% 
+  # filter(Overall>0) %>%
+  # filter(optVars) %>%
+  # filter(rank<20) %>%
+  # mutate(Overall=ifelse(model=="GLM",log(Overall),Overall)) %>%
+  ggplot(aes(x=var,y=rankNA,color=model,fill=model))+geom_violin()+
+  facet_wrap(var~.,scales="free_x")
+summary_rfe_var_imp <- rfe_var_imp %>% 
+  group_by(model,var) %>% 
+  summarise(meanScaledImp=mean(Scaled_imp,na.rm=T),
+            medianScaledImp=median(Scaled_imp,na.rm=T),
+            meanRankNA=mean(rankNA,na.rm=T),
+            medRankNA=median(rankNA,na.rm=T),
+            meanRank=mean(rank,na.rm=T),
+            medRank=median(rank,na.rm=T)) %>% 
+  ungroup()
+
+summary_rfe_var_imp %>% mutate(var=factor(var,levels=top_vars$var)) %>% filter(model!="GLM") %>% 
+  ggplot( aes(model, var, fill= meanScaledImp)) + 
+  geom_tile(color = "gray")+
+    scale_fill_viridis(discrete=FALSE) +
+  theme.set+
+  xlab(NULL)+
+  ylab(NULL)+
+  theme(axis.text = element_text(size=12))
+summary_rfe_var_imp %>% mutate(var=factor(var,levels=top_vars$var)) %>% 
+  ggplot( aes(model, var, fill= meanRank)) + 
+  geom_tile()+
+    scale_fill_viridis(discrete=FALSE,direction = -1)
+summary_rfe_var_imp %>% mutate(var=factor(var,levels=top_vars$var)) %>% 
+  ggplot( aes(model, var, fill= medRank)) + 
+  geom_tile()+
+    scale_fill_viridis(discrete=FALSE,direction = -1)# 
+
+library(ggridges)
+library(ggplot2)
+
+# Diamonds dataset is provided by R natively
+#head(diamonds)
+ 
+# basic example
+rfe_var_imp %>% 
+  mutate(var=factor(var,levels=top_vars$var))  %>% filter(var%in%c(top_vars$var[1:6],top_vars$var[20:25])) %>% 
+ggplot( aes(x = Scaled_imp, y = model, fill = model)) +
+  geom_density_ridges() +
+  theme_ridges() + 
+  theme(legend.position = "none")+
+  facet_wrap(.~var)+
+  coord_cartesian(xlim=c(0,1))
+rfe_var_imp %>% 
+  mutate(var=factor(var,levels=top_vars$var))  %>% filter(var%in%top_vars$var[1:12]) %>% 
+ggplot( aes(x = Scaled_imp, y = model, fill = model)) +
+  geom_density_ridges() +
+  theme_ridges() + 
+  theme(legend.position = "none")+
+  facet_wrap(.~var)+
+  coord_cartesian(xlim=c(0,1))
+
+rfe_var_imp %>% 
+  mutate(var=factor(var,levels=top_vars$var))  %>% filter(var%in%top_vars$var[1:20]) %>% 
+  filter(model!="GLM") %>% 
+ggplot( aes(x = Scaled_imp, y = model, fill = model)) +
+  geom_density_ridges() +
+  theme_ridges() + 
+  theme(legend.position = "none")+
+  facet_wrap(.~var)+
+  coord_cartesian(xlim=c(0,1))
+
+rfe_var_imp %>% 
+  mutate(var=factor(var,levels=top_vars$var))  %>% filter(var%in%top_vars$var[1:12]) %>% 
+  filter(model!="GLM") %>% 
+ggplot( aes(x = rank, y = model, fill = model)) +
+  geom_density_ridges() +
+  theme_ridges() + 
+  theme(legend.position = "none")+
+  facet_wrap(.~var)+
+  coord_cartesian(xlim=c(0,20))
+
+
+
+# library
+library(ggridges)
+library(ggplot2)
+library(viridis)
+library(hrbrthemes)
+glm_varimp <-varImp(cv_glm,lambda = .44)%>%   
+  rownames_to_column(var = "Gene.Symbol") %>%  
+  full_join(gene.list.fill) %>% 
+  mutate(Overall=ifelse(is.na(Overall),0,Overall)) %>% 
+  mutate(Scaled_imp=(Overall-min(Overall))/(max(Overall)-min(Overall))) %>% 
+  mutate(model="GLM_EN")%>% 
+  rename(Imp=Overall)
+svm_varimp <-varImp(rfe_svm2)%>%   
+  rownames_to_column(var = "Gene.Symbol") %>%  
+  full_join(gene.list.fill) %>% 
+    mutate(Overall=ifelse(is.na(Overall),0,Overall)) %>% 
+  mutate(Scaled_imp=Overall)%>% 
+  mutate(model="SVM")%>% 
+  rename(Imp=Overall)
+nb_varimp <-varImp(rfe_nb)%>%   
+  rownames_to_column(var = "Gene.Symbol") %>%  
+  full_join(gene.list.fill)%>% 
+  mutate(Overall=ifelse(is.na(Overall),0,Overall)) %>% 
+  mutate(Scaled_imp=Overall)%>% 
+  mutate(model="NB")%>% 
+  rename(Imp=Overall)
+rf_varimp <- varImp(rfe_rf$fit) %>%   
+  rownames_to_column(var = "Gene.Symbol") %>%  
+  full_join(gene.list.fill)%>% 
+  rename(varimp_raw="0") %>% 
+    mutate(varimp_raw=ifelse(is.na(varimp_raw),0,varimp_raw)) %>% 
+  mutate(Scaled_imp=(varimp_raw-min(varimp_raw))/(max(varimp_raw)-min(varimp_raw)))%>% 
+  # rownames_to_column(var = "Gene.Symbol") %>% 
+  mutate(model="RF") %>% 
+  rename(Imp=varimp_raw)
+nn_varimp <-varImp(rfe_nn$fit)$importance %>%   
+  rownames_to_column(var = "Gene.Symbol") %>%  
+  full_join(gene.list.fill)%>% 
+    mutate(Overall=ifelse(is.na(Overall),0,Overall)) %>% 
+  mutate(Scaled_imp=Overall/100)%>% 
+  # rownames_to_column(var = "Gene.Symbol") %>% 
+  mutate(model="NN") %>% 
+  rename(Imp=Overall)
+
+# library(ggbump)
+
+all_varimp <- bind_rows(nn_varimp,rf_varimp,nb_varimp,svm_varimp,glm_varimp) %>% 
+  select(model,Gene.Symbol,Imp,Scaled_imp) %>% 
+  group_by(model) %>% 
+  arrange(desc(Scaled_imp)) %>% 
+  mutate(rank=ifelse(Scaled_imp==0,84,row_number()),
+         TopN=ifelse(rank<=15,1,0)) %>% 
+  ungroup() %>%
+  group_by(Gene.Symbol) %>% 
+  mutate(TopN_any=max(TopN)) %>% 
+  ungroup()%>% 
+  mutate(model=factor(model,levels=c("RF","NN","SVM","NB","GLM","GLM_EN"),
+                      labels=c("Random\n Forest","Neural\n Net","Support Vector\n Machine","Naive\n Bayes","GLM","GLM\n Elastic Net")))
+
+
+plot_varimp1 <- all_varimp %>% filter(TopN==1) %>% 
+  group_by(Gene.Symbol) %>% 
+  count() %>% 
+  arrange(desc(n))
+plot_varimp1 %>% 
+  mutate(Gene.Symbol=factor(Gene.Symbol,levels=plot_varimp1$Gene.Symbol)) %>% 
+  ggplot(aes(x=Gene.Symbol,y=n)) +
+  geom_bar(stat="identity")
+
+plot_varimp12 <- all_varimp %>% filter(TopN==1) 
+plot_varimp12 %>% 
+  mutate(Gene.Symbol=factor(Gene.Symbol,levels=rev(plot_varimp1$Gene.Symbol))) %>% 
+  ggplot(aes(x=Gene.Symbol,y=TopN,color=model,fill=model)) +
+  geom_bar(stat="identity",position = "stack")+
+  theme.set+
+  theme(legend.position = c(.8, 0.2),
+        legend.text = element_text(size=14))+
+  scale_fill_few()+
+  scale_color_few()+
+  ylab("Number of Models")+
+  xlab(NULL)+
+  coord_flip()
+
+show.top.n <- 15
+all_varimp%>% mutate(Gene.Symbol=factor(Gene.Symbol,levels=top_vars$var))  %>% filter(TopN==1) %>% 
+  ggplot(aes(x=Gene.Symbol,y=Scaled_imp,color=model,fill=model))+
+  geom_bar(stat = 'identity')+
+  facet_wrap(.~model,nrow = 1)+
+  coord_flip()
+
+
+all_varimp %>% mutate(Gene.Symbol=factor(Gene.Symbol,levels=top_vars$var)) %>% filter(Gene.Symbol%in%top_vars$var[1:16]) %>% 
+  ggplot(aes(x=Gene.Symbol,y=Scaled_imp,color=model,fill=model))+
+  geom_bar(stat = 'identity',position="dodge")+
+  facet_wrap(.~Gene.Symbol,scales="free_x")
+
+all_varimp %>% mutate(Gene.Symbol=factor(Gene.Symbol,levels=top_vars$var)) %>% filter(Gene.Symbol%in%top_vars$var[1:16]) %>% 
+  ggplot(aes(x=Gene.Symbol,y=Scaled_imp,color=model,fill=model))+
+  geom_bar(stat = 'identity',position="dodge")#+
+  # facet_wrap(.~Gene.Symbol,scales="free_x")
+all_varimp %>% mutate(Gene.Symbol=factor(Gene.Symbol,levels=top_vars$var))  %>% filter(TopN_any==1) %>% 
+  ggplot(aes(x=Gene.Symbol,y=Scaled_imp,color=model,fill=model))+
+  geom_bar(stat = 'identity',position="dodge")
+all_varimp %>% #mutate(Gene.Symbol=factor(Gene.Symbol,levels=top_vars$var)) %>% 
+  ggplot( aes(model, Gene.Symbol, fill= Scaled_imp)) + 
+  geom_tile()+
+    scale_fill_viridis(discrete=FALSE) 
+all_varimp %>% #mutate(Gene.Symbol=factor(Gene.Symbol,levels=top_vars$var)) %>% 
+  ggplot( aes(model, Gene.Symbol, fill= rank)) + 
+  geom_tile()+
+    scale_fill_viridis(discrete=FALSE,direction = -1)   # coord_flip()
+
+wide_varimp <- all_varimp %>% filter(rank<=10)%>% select(model,Gene.Symbol,Imp) %>% 
+  pivot_wider(names_from = "model",values_from = "Imp",values_fill = 0)
+
+
+
+
+# Libraries
+library(hrbrthemes)
+library(GGally)
+library(viridis)
+
+# Data set is provided by R natively
+# data <- iris
+# Plot
+ggparcoord(wide_varimp ,
+    columns = 2:6, groupColumn = 1,scale="uniminmax",
+    showPoints = TRUE, 
+    title = "Parallel Coordinate Plot for the Iris Data",
+    alphaLines = 0.3
+    ) + 
+  scale_color_viridis(discrete=TRUE) +
+  theme_ipsum()+
+  theme(
+    plot.title = element_text(size=10)
+  )
+
+wide_varimp_all <- rfe_var_imp %>% pivot_wider(names_from = "model",values_from = "Overall",values_fill = 0)
+
+ggparcoord(wide_varimp_all %>% filter(var%in%c("CCL5","CXCL1","IL6","CCL20","TNF")),
+    columns = 7:11, groupColumn = 4,scale="uniminmax",
+    showPoints = TRUE, 
+    title = "Parallel Coordinate Plot for the Iris Data",
+    alphaLines = 0.3
+    ) + 
+  scale_color_viridis(discrete=TRUE) +
+  theme_ipsum()+
+  theme(
+    plot.title = element_text(size=10)
+  )
+
+
+wide_varimp_all_rank <- rfe_var_imp %>% select(-Overall)%>% pivot_wider(names_from = "model",values_from = "rank",values_fill = 84) %>% 
+  mutate(var=factor(var,levels=top_vars$var)) 
+
+
+
+ggparcoord(wide_varimp_all_rank %>% filter(var%in%show.top.n),
+    columns = 6:10, groupColumn = 4,scale="globalminmax",
+    showPoints = TRUE, 
+    title = "Parallel Coordinate Plot for the Iris Data",
+    alphaLines = 0.3
+    ) + 
+  scale_color_viridis(discrete=TRUE) +
+  theme_ipsum()+
+  theme(
+    plot.title = element_text(size=10)
+  )+
+  scale_y_reverse(breaks = c(1:10,6:15*2,7:16*5,84))+
+  coord_cartesian(ylim = c(84,1))+
+  facet_wrap(.~var)
+# load the library
+# wide_varimp_all_rank <-
+
+test <-  rfe_var_imp %>% select(-Overall)%>% pivot_wider(names_from = "model",values_from = "rank",values_fill = NA) %>% 
+  mutate(var=factor(var,levels=top_vars$var))  %>% pivot_longer(6:10,names_to = "Model",values_to = "Rank")
+
+
+ggplot(test %>% filter(var%in%show.top.n),
+       aes(x=var,y=Rank,color=Model,fill=Model))+geom_violin()+facet_wrap(.~var,scales = "free") + theme_ipsum()+
+  theme(
+    plot.title = element_text(size=10)
+  )+
+  coord_cartesian(ylim = c(84,1))
+
+
+ggplot(test %>% filter(var%in%show.top.n),
+       aes(x=var,y=Rank,color=var,fill=var))+geom_violin()+facet_wrap(.~Model,scales = "free") + theme_ipsum()+
+  theme(
+    plot.title = element_text(size=10)
+  )+
+  coord_cartesian(ylim = c(84,1))
+
+test <-  rfe_var_imp %>% pivot_wider(names_from = "model",values_from = "Overall",values_fill = NA)  %>% 
+  pivot_longer(7:11,names_to = "Model",values_to = "Imp")
+
+
+ggplot(test %>% filter(var%in%show.top.n),
+       aes(x=var,y=Imp,color=Model,fill=Model))+geom_violin()+facet_wrap(.~var,scales = "free") + theme_ipsum()+
+  theme(
+    plot.title = element_text(size=10)
+  )
+
+
+ggplot(test %>% filter(var%in%show.top.n),
+       aes(x=var,y=Imp,color=var,fill=var))+geom_violin()+facet_wrap(.~Model,scales = "free") + theme_ipsum()+
+  theme(
+    plot.title = element_text(size=10)
+  )
+
+
+
+
+library(forcats)
+
+
+
+
+# Reorder following the value of another column:
+all_varimp %>%
+  group_by(model) %>% 
+  arrange(desc(Imp)) %>%    # First sort by val. This sort the dataframe but NOT the factor levels
+  mutate(Gene.Symbol=factor(Gene.Symbol, levels=Gene.Symbol)) %>% 
+  filter(rank<=15) %>% 
+# mutate(Gene.Symbol = fct_reorder(as.factor(Gene.Symbol), rank)) %>%
+  ggplot( aes(x=Gene.Symbol, y=Imp,color=model,fill=model)) +
+    geom_bar(stat="identity",position="dodge", alpha=.6, width=.4) +
+    coord_flip() +
+    xlab("") +
+    theme_bw()+
+    facet_wrap(.~model,scales="free",nrow=1)
+ 
+# Reverse side
+data %>%
+  mutate(name = fct_reorder(name, desc(val))) %>%
+  ggplot( aes(x=name, y=val)) +
+    geom_bar(stat="identity", fill="#f68060", alpha=.6, width=.4) +
+    coord_flip() +
+    xlab("") +
+    theme_bw()
+
+
+ggplot(all_varimp , aes(x = model, y = rank, color = Gene.Symbol,group=Gene.Symbol)) +
+  geom_point()+
+  geom_line()+
+  scale_y_reverse(breaks = show.top.n:1)+
+  coord_cartesian(ylim = c(show.top.n,1),
+                  xlim = c(.70,5.3)) +
+  theme(legend.position = "none") +
+geom_text(data = all_varimp %>% filter(model == "GLM"),
+          aes(label = Gene.Symbol, x = .75) , hjust = .85, fontface = "bold", color = "#888888", size = 4) +
+  geom_text(data = all_varimp %>% filter(model == "SVM"),
+            aes(label = Gene.Symbol, x = 5.25) , hjust = 0.15, fontface = "bold", color = "#888888", size = 4) 
+
+
+
+ggplot(data = all_varimp, aes(x = model, y = Scaled_imp, group = Gene.Symbol)) +
+  geom_line(aes(color = Gene.Symbol, alpha = 1), size = 2) +
+  geom_point(aes(color = Gene.Symbol, alpha = 1), size = 4) +
+  geom_point(color = "#FFFFFF", size = 1) +
+  # scale_y_reverse(breaks = show.top.n:1) +
+  scale_x_discrete(breaks = unique(all_varimp$model), expand = c(.25, .25)) +
+  geom_text(data = all_varimp %>% filter(model == "GLM"),
+          aes(label = Gene.Symbol, x = .75) , hjust = .85, fontface = "bold", color = "#888888", size = 4) +
+  geom_text(data = all_varimp %>% filter(model == "SVM"),
+            aes(label = Gene.Symbol, x = 5.25) , hjust = 0.15, fontface = "bold", color = "#888888", size = 4) +
+  # coord_cartesian(ylim = c(show.top.n,1)) + 
+  theme(legend.position = "none") 
+
+```
+
+
+# Final Models Error Analysis
+```{r Errors, message=FALSE, warning=FALSE}
+generate.errors.ML <- function(model.string,model.obj,predictors){
+  y <- predictors$LPS.Added
+  if(model.string %in% c("RF","NB","GLM")){
+    observed <- as.factor(y)
+    CM <- caret::confusionMatrix(predict(model.obj, predictors)$pred,observed)
+  } else if(model.string%in%c("NN","SVM")){
+    observed <- as.factor(y)  
+    CM <- caret::confusionMatrix(predict(model.obj, predictors),observed)
+  }
+    # } else if(grepl("NN",model.string)){
+    #   observed <- as.factor(y)
+    #   CM <- caret::confusionMatrix(factor(predict(model.obj,newdata=predictors),levels=c(0,1)),observed)
+    # } else if(model.string=="GLM"){
+    #   # observed <- as.vector(y)
+    #   # CM <- caret::confusionMatrix(
+    #   #   as.factor(predict(model.obj,
+    #   #                     as.matrix(predictors[, -which(colnames(predictors) ==
+    #   #                                                     "LPS.Added")]),type="class",s='lambda.min')),
+    #   #   as.factor(observed))
+    #   observed <- as.factor(y)
+    #   CM <- caret::confusionMatrix(as.factor(ifelse(predict(model.obj,newdata = predictors,type="response")>.5,0,1)),
+    #                         observed)
+    # } 
+  error.vec <- c(CM$overall,CM$byClass)
+  return(error.vec)
+}
+## GLM Elastic Net
+p <- predict(cv_glm,newx = as.matrix(train_data_scaled[,-c(1)]),s=.44,type="response") # Probabilities(of 1)
+as.factor(predict(cv_glm,newx = as.matrix(train_data_scaled[,-c(1)]),s=.44,type="class")) # class
+## NN
+predict(rfe_nn$fit,newdata=train_data_scaled,type="prob")$`1` # Probabilities
+predict(rfe_nn$fit,newdata=train_data_scaled,type="raw") # class
+## SVM
+library(kernlab)
+# vars_incl <- colnames(rfe_svm$fit$trainingData)[1:(length(colnames(rfe_svm$fit$trainingData))-1)]
+rebuild_svm <- ksvm(LPS.Added~.,data=train_data_scaled[,c("LPS.Added",vars_incl)],type="C-svc",kernel="vanilladot",prob.model=TRUE,C=.1)
+predict(rebuild_svm,newdata=train_data_scaled,type="probabilities")[,2] #Prob
+predict(rebuild_svm,newdata=train_data_scaled,type="response") #class
+
+### RF
+predict(rfe_rf$fit,newdata=train_data_scaled,type="response")#class
+predict(rfe_rf$fit,newdata=train_data_scaled,type="prob")[,2]#Prob
+
+### NB
+predict(rfe_nb$fit,newdata=train_data_scaled,type="response")$class#class
+predict(rfe_nb$fit,newdata=train_data_scaled,type="prob")$posterior[,2]#Prob
+
+generate.errors.ML <- function(model.string,model.obj,predictors){
+  y <- predictors$LPS.Added
+  if(model.string %in% c("RF")){
+    observed <- as.factor(y)
+    class_pred <- as.factor(predict(model.obj,predictors,type="response"))
+    prob_pred <- predict(model.obj,predictors,type="prob")[,2]
+    CM <- caret::confusionMatrix(class_pred,observed)
+  } else if(model.string%in%c("SVM")){
+    observed <- as.factor(y)  
+    class_pred <- as.factor(predict(model.obj,predictors,type="response"))
+    prob_pred <- predict(model.obj,predictors,type="probabilities")[,2]
+    colnames(prob_pred) <- NULL
+    CM <- caret::confusionMatrix(class_pred,observed)
+  } else if(grepl("GLM_EN",model.string)){
+    # predict(cv_glm,newx = as.matrix(train_data_scaled[,-c(1)]),s=.44,type="response") # Probabilities(of 1)
+    # predict(cv_glm,newx = as.matrix(train_data_scaled[,-c(1)]),s=.44,type="class") # class
+    observed <- as.factor(y)
+    class_pred <- as.factor(predict(model.obj,as.matrix(predictors[-c(1)]),type="class",s=.44))
+    prob_pred <- predict(model.obj,as.matrix(predictors[-c(1)]),type="response",s=.44)
+    CM <- caret::confusionMatrix(class_pred,observed)
+  } else if(grepl("NB",model.string)){
+    observed <- as.factor(y)
+    class_pred <- as.factor(predict(model.obj,predictors,type="response")$class)
+    prob_pred <- predict(model.obj,predictors,type="prob")$posterior[,2]
+    CM <- caret::confusionMatrix(class_pred,observed)
+  }else if(grepl("NN",model.string)){
+    observed <- as.factor(y)  
+    class_pred <- as.factor(predict(model.obj,predictors,type="raw"))
+    prob_pred <- predict(model.obj,predictors,type="prob")[,2]
+    CM <- caret::confusionMatrix(class_pred,observed)
+  }
+  error.vec <- c(CM$overall,CM$byClass)
+  return(list(error.vec,data.frame(prob_1=prob_pred,prob_0=1-prob_pred,class_pred=class_pred,observed=observed) %>% rename(prob_1=1,prob_0=2)))
+}
+
+generate.errors.ML("GLM_EN",cv_glm,train_data_scaled)
+
+errors.all.data.conf <- function(model.string,model.obj){
+  error.df <- generate.errors.ML(model.string,model.obj,train_data_scaled)[[2]] %>% 
+    mutate(model=model.string) %>% 
+    mutate(dataset="train") %>% 
+    bind_rows(generate.errors.ML(model.string,model.obj,test_data_scaled)[[2]] %>% 
+    mutate(model=model.string) %>% 
+    mutate(dataset="test"))%>% 
+    bind_rows(generate.errors.ML(model.string,model.obj,MJ.LPS_data_scaled)[[2]] %>% 
+    mutate(model=model.string) %>% 
+    mutate(dataset="MJ"))
+  return(error.df)
+}
+err_conf <- bind_rows(errors.all.data.conf("RF",rfe_rf$fit),
+                     errors.all.data.conf("NB",rfe_nb$fit),
+                     errors.all.data.conf("SVM",rebuild_svm),
+                     errors.all.data.conf("NN",rfe_nn$fit),
+                     errors.all.data.conf("GLM_EN",cv_glm)) %>% 
+  mutate(prob_observed=ifelse(observed==0,prob_0,prob_1))
+
+ggplot(err_conf ,aes(x=model,y=prob_observed,color=dataset,fill=dataset))+
+  geom_violin(scale="width",alpha=.3)#+
+  # facet_grid(.~model)
+
+ggplot(err_conf ,aes(x=prob_observed,color=dataset))+
+  geom_density()+
+  facet_wrap(~model,scales = "free")
+
+ggplot(err_conf,aes(x=prob_observed,color=dataset,fill=observed))+
+  geom_density()+
+  facet_wrap(.~model,scales = "free")
+errors.all.data <- function(model.string,model.obj){
+  error.df <- data.frame(
+    cbind(
+      train=generate.errors.ML(model.string,model.obj,train_data_scaled)[[1]],
+      test=generate.errors.ML(model.string,model.obj,test_data_scaled)[[1]],
+      mj_LPS=generate.errors.ML(model.string,model.obj,MJ.LPS_data_scaled)[[1]]
+      )
+  ) %>% 
+    mutate(model=model.string) %>% 
+    select(model,train:mj_LPS) %>% 
+    rownames_to_column(var="metric")
+}
+RF.errors <- errors.all.data("RF",rfe_rf$fit) 
+NB.errors <- errors.all.data("NB",rfe_nb$fit) 
+SVM.errors <- errors.all.data("SVM",rebuild_svm) 
+NN.errors <- errors.all.data("NN",rfe_nn$fit)
+GLM.errors <- errors.all.data("GLM_EN",cv_glm)
+print(xtable(rbind(RF.errors[1,-6],
+      NB.errors[1,-6],
+      SVM.errors[1,-6],
+      NN.errors[1,-6],
+      GLM.errors[1,-6]
+      ),digits=4),include.rownames=FALSE)
+```
+
+```{r ROC}
+library(pROC)
+predicted_rf <-  predict(rfe_rf$fit,test_data_scaled,type = "prob")[,2]
+roc_obj_rf <- roc(test_data_scaled$LPS.Added,predicted_rf)
+auc_rf <- round(auc(test_data_scaled$LPS.Added,predicted_rf),4)
+
+#create ROC plot
+ggroc(roc_obj_rf, colour = 'steelblue', size = 2) +
+  ggtitle(paste0('ROC Curve ', '(AUC = ', auc_rf, ')'))
+roc_obj_nn <- roc(as.numeric(test_data_scaled$LPS.Added), predict(rfe_nn$fit,test_data_scaled,type = "prob")[,2])
+ggroc(roc_obj_nn)
+
+
+roc_obj_glm <- roc(as.numeric(test_data_scaled$LPS.Added), predict(cv_glm,as.matrix(test_data_scaled[,-1]),type = "response")[,2])
+ggroc(roc_obj_glm)
+
+roc_obj_svm <- roc(as.numeric(test_data_scaled$LPS.Added), predict(rebuild_svm,test_data_scaled,type = "prob")[,2])
+ggroc(roc_obj_svm)
+
+
+roc_obj_nb <- roc(as.numeric(test_data_scaled$LPS.Added), predict(rfe_nb$fit,test_data_scaled,type = "prob")$posterior[,2])
+ggroc(roc_obj_nb)
+
+roc_auc_fxn <- function(model.string,model.obj){
+  predictions<- bind_rows(generate.errors.ML(model.string,model.obj,train_data_scaled)[[2]] %>%
+    mutate(datatype = "train")%>% 
+    mutate(auc_metric = as.numeric(auc(observed,prob_1))),
+    generate.errors.ML(model.string,model.obj,test_data_scaled)[[2]] %>%
+    mutate(datatype = "test")%>% 
+    mutate(auc_metric = as.numeric(auc(observed,prob_1))),
+    generate.errors.ML(model.string,model.obj,MJ.LPS_data_scaled)[[2]] %>%
+    mutate(datatype = "MJ")%>% 
+    mutate(auc_metric = as.numeric(auc(observed,prob_1)))
+  ) %>% 
+    mutate(model= model.string) %>% 
+    select(datatype, auc_metric,model) %>% distinct()
+  return(predictions)
+}
+
+RF.auc <- roc_auc_fxn("RF",rfe_rf$fit) 
+NB.auc <- roc_auc_fxn("NB",rfe_nb$fit) 
+SVM.auc <- roc_auc_fxn("SVM",rebuild_svm) 
+NN.auc <- roc_auc_fxn("NN",rfe_nn$fit)
+GLM.auc <- roc_auc_fxn("GLM_EN",cv_glm)
+print(xtable(rbind(RF.auc,
+      NB.auc,
+      SVM.auc,
+      NN.auc,
+      GLM.auc
+      ),digits=4),include.rownames=FALSE)
+
+```
